@@ -1,0 +1,42 @@
+{
+  "name": "codex-p4-diff",
+  "version": "0.2.0",
+  "description": "把 Perforce #have 基线接入真实工作区，在 Codex 原生 Review 中查看差异，并可调用本机 P4V Diff。",
+  "author": {
+    "name": "BillyCSZhao",
+    "url": "https://github.com/BillyCSZhao"
+  },
+  "homepage": "https://github.com/BillyCSZhao/codex-p4-diff#readme",
+  "repository": "https://github.com/BillyCSZhao/codex-p4-diff",
+  "license": "MIT",
+  "keywords": [
+    "perforce",
+    "p4",
+    "diff",
+    "code-review",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex P4 Diff",
+    "shortDescription": "检查环境并用原生 Review 审阅真实 P4 差异。",
+    "longDescription": "先诊断 Python、P4、Git、P4V、P4 映射、忽略规则和目录权限，再以 P4 #have 为 Git 基线，把外置 Git 元数据连接到当前真实 P4 工作区，使 Codex 原生 Review 显示未暂存和已暂存差异。Git 暂存与还原会直接作用于真实 P4 文件；Git 提交被禁用，正式提交继续使用 Perforce。",
+    "developerName": "BillyCSZhao",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/BillyCSZhao/codex-p4-diff",
+    "privacyPolicyURL": "https://github.com/BillyCSZhao/codex-p4-diff/blob/main/PRIVACY.md",
+    "termsOfServiceURL": "https://github.com/BillyCSZhao/codex-p4-diff/blob/main/TERMS.md",
+    "brandColor": "#6C63FF",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png",
+    "defaultPrompt": [
+      "检查当前 P4 环境并启用 Codex 原生 Review。",
+      "刷新当前 P4 变更列表的原生 Review。",
+      "用 P4V diffhave 打开当前文本差异。"
+    ]
+  }
+}

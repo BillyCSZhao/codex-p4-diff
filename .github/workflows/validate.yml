@@ -1,0 +1,45 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python -m py_compile plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_diff.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Windows launcher
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File plugins/codex-p4-diff/skills/codex-p4-diff/scripts/run_codex_p4_diff.ps1 --help
+      - name: POSIX launcher
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh plugins/codex-p4-diff/skills/codex-p4-diff/scripts/run_codex_p4_diff.sh --help
+      - name: Parse distribution manifests
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          root = Path.cwd()
+          manifest = json.loads((root / "plugins/codex-p4-diff/.codex-plugin/plugin.json").read_text(encoding="utf-8"))
+          marketplace = json.loads((root / ".agents/plugins/marketplace.json").read_text(encoding="utf-8"))
+          assert manifest["name"] == marketplace["plugins"][0]["name"]
+          assert manifest["version"] == "0.2.0"

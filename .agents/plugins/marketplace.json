@@ -1,0 +1,20 @@
+{
+  "name": "billycszhao-plugins",
+  "interface": {
+    "displayName": "BillyCSZhao Plugins"
+  },
+  "plugins": [
+    {
+      "name": "codex-p4-diff",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-p4-diff"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp
+*.bak
+.codex-tool/
+.codex-test-home/
