@@ -21,9 +21,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile
-        run: python -m py_compile plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_diff.py
+        run: >-
+          python -m py_compile
+          plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_diff.py
+          plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_audit.py
+          plugins/codex-p4-diff/hooks/codex_p4_session.py
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Session audit tests
+        run: python -m unittest discover -s plugins/codex-p4-diff/tests -v
       - name: Windows launcher
         if: runner.os == 'Windows'
         shell: powershell
@@ -41,5 +47,14 @@ jobs:
           root = Path.cwd()
           manifest = json.loads((root / "plugins/codex-p4-diff/.codex-plugin/plugin.json").read_text(encoding="utf-8"))
           marketplace = json.loads((root / ".agents/plugins/marketplace.json").read_text(encoding="utf-8"))
+          hooks = json.loads((root / "plugins/codex-p4-diff/hooks/hooks.json").read_text(encoding="utf-8"))
           assert manifest["name"] == marketplace["plugins"][0]["name"]
-          assert manifest["version"] == "0.2.0"
+          assert manifest["version"] == "0.3.0"
+          assert set(hooks["hooks"]) == {
+              "SessionStart",
+              "UserPromptSubmit",
+              "PreToolUse",
+              "PostToolUse",
+              "Stop",
+              "SessionEnd",
+          }

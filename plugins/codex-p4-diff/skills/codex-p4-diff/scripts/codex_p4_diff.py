@@ -26,6 +26,7 @@ from urllib.parse import quote
 TOOL_NAME = "codex-p4-diff"
 MARKER_NAME = "codex-p4-diff.json"
 SCHEMA_VERSION = 2
+AUDIT_SCHEMA_VERSION = 1
 BASELINE_REF = "refs/heads/codex-p4-have"
 REPOSITORY_URL = "https://github.com/BillyCSZhao/codex-p4-diff"
 TROUBLESHOOTING_URL = f"{REPOSITORY_URL}#troubleshooting"
@@ -498,6 +499,25 @@ def default_sidecar(info: dict[str, str], client: str, changelist: str, project_
     return user_data_root() / "CodexP4Diff" / "Native" / f"{sanitize_component(client)}-{server_hash}" / f"{sanitize_component(changelist)}-{scope_hash}"
 
 
+def audit_project_root(info: dict[str, str], client: str, project_root: Path) -> Path:
+    server = info.get("serverAddress") or "server"
+    server_hash = hashlib.sha256(server.lower().encode("utf-8")).hexdigest()[:10]
+    scope_hash = hashlib.sha256(canonical(project_root).encode("utf-8")).hexdigest()[:10]
+    return (
+        user_data_root()
+        / "CodexP4Diff"
+        / "Audit"
+        / f"{sanitize_component(client)}-{server_hash}"
+        / scope_hash
+    )
+
+
+def audit_session_root(
+    info: dict[str, str], client: str, project_root: Path, session_id: str
+) -> Path:
+    return audit_project_root(info, client, project_root) / "sessions" / sanitize_component(session_id)
+
+
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -520,6 +540,76 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CodexP4DiffError(f"{path} 应为 JSON 对象")
     return value
+
+
+def resolve_auto_changelist(
+    info: dict[str, str], client: str, project_root: Path, session_id: str | None
+) -> str:
+    if not session_id:
+        raise CodexP4DiffError(
+            "--changelist auto 需要 Codex 会话 ID；请从 Codex 中运行，或显式传入数字变更列表。"
+        )
+    ledger_path = audit_session_root(info, client, project_root, session_id) / "session.json"
+    if not ledger_path.is_file():
+        raise CodexP4DiffError(
+            f"当前会话尚未建立 P4 变更列表：{ledger_path}。先让 Codex 完成一次文件修改，"
+            "或显式传入 --changelist <数字>。"
+        )
+    ledger = read_json(ledger_path)
+    expected = {
+        "schemaVersion": AUDIT_SCHEMA_VERSION,
+        "generatedBy": TOOL_NAME,
+        "sessionId": session_id,
+        "client": client,
+        "serverAddress": info.get("serverAddress") or "",
+        "userName": info.get("userName") or "",
+        "clientRoot": info.get("clientRoot") or "",
+        "projectRoot": str(project_root.resolve()),
+    }
+    mismatches: list[str] = []
+    for key, expected_value in expected.items():
+        recorded = ledger.get(key)
+        if key in {"projectRoot", "clientRoot"}:
+            same = bool(
+                recorded
+                and canonical(Path(str(recorded))) == canonical(Path(str(expected_value)))
+            )
+        else:
+            same = str(recorded or "").casefold() == str(expected_value).casefold()
+        if not same:
+            mismatches.append(f"{key}={recorded!r}")
+    if mismatches:
+        raise CodexP4DiffError(
+            "当前会话账本不属于所选 P4 上下文：" + "；".join(mismatches)
+        )
+    changelist = str(ledger.get("changelist") or "")
+    if not changelist.isdigit():
+        raise CodexP4DiffError("当前会话尚未创建 pending changelist。")
+    return changelist
+
+
+def validate_auto_changelist_context(
+    p4_exe: str,
+    client: str,
+    project_root: Path,
+    changelist: str,
+    session_id: str,
+) -> None:
+    completed = run_command(
+        [p4_exe, "-c", client, "change", "-o", changelist],
+        cwd=project_root,
+    )
+    spec = decode_output(completed.stdout)
+    status = re.search(r"(?im)^Status:\s*(\S+)", spec)
+    recorded_client = re.search(r"(?im)^Client:\s*(\S+)", spec)
+    if not status or status.group(1).lower() != "pending":
+        raise CodexP4DiffError(f"会话 changelist {changelist} 不是 pending 状态。")
+    if not recorded_client or recorded_client.group(1).casefold() != client.casefold():
+        raise CodexP4DiffError(f"会话 changelist {changelist} 不属于 P4 client {client}。")
+    if "Managed-By: codex-p4-diff" not in spec or f"Codex-Session: {session_id}" not in spec:
+        raise CodexP4DiffError(
+            f"会话 changelist {changelist} 缺少当前 Codex 会话所有权标记，拒绝自动使用。"
+        )
 
 
 def parse_p4_setting(raw: bytes, name: str) -> str | None:
@@ -1256,7 +1346,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", help="显式指定 P4PORT")
     parser.add_argument("--user", help="显式指定 P4USER")
     parser.add_argument("--p4v-connection-map", help="P4V connectionmap.xml 路径")
-    parser.add_argument("--changelist", default="default", help="default 或数字形式的待提交变更列表")
+    parser.add_argument(
+        "--changelist",
+        default="default",
+        help="default、auto 或数字形式的待提交变更列表；auto 使用当前 Codex 会话 CL",
+    )
     parser.add_argument("--sidecar", help="外置 Git 元数据目录；默认位于当前用户的本地应用数据目录")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--enable-native-review", action="store_true", help="启用或刷新原生 Codex Review")
@@ -1281,9 +1375,9 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        changelist = str(args.changelist)
-        if changelist != "default" and not changelist.isdigit():
-            raise CodexP4DiffError("--changelist 必须为 default 或数字形式")
+        requested_changelist = str(args.changelist)
+        if requested_changelist not in {"default", "auto"} and not requested_changelist.isdigit():
+            raise CodexP4DiffError("--changelist 必须为 default、auto 或数字形式")
         workspace = Path(args.workspace).resolve()
         if not workspace.exists():
             raise CodexP4DiffError(f"工作区范围不存在：{workspace}")
@@ -1331,6 +1425,25 @@ def main() -> int:
         if not client_root_text:
             raise CodexP4DiffError(f"Perforce 客户端 {client!r} 没有 clientRoot")
         client_root = Path(client_root_text).resolve()
+        session_id = os.environ.get("CODEX_THREAD_ID")
+        changelist = (
+            resolve_auto_changelist(
+                info,
+                client,
+                project_root,
+                session_id,
+            )
+            if requested_changelist == "auto"
+            else requested_changelist
+        )
+        if requested_changelist == "auto":
+            validate_auto_changelist_context(
+                p4_exe,
+                client,
+                project_root,
+                changelist,
+                str(session_id),
+            )
         files = opened_files(p4_exe, client, workspace, changelist, client_root, project_root)
 
         result: dict[str, Any] = {
@@ -1340,6 +1453,7 @@ def main() -> int:
             "clientRoot": str(client_root),
             "projectRoot": str(project_root),
             "workspaceScope": str(workspace),
+            "requestedChangelist": requested_changelist,
             "changelist": changelist,
             "openedFileCount": len(files),
             "files": files,

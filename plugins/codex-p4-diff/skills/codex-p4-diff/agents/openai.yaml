@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex P4 Diff"
-  short_description: "检查环境并用原生 Review 审阅真实 P4 差异"
-  default_prompt: "使用 $codex-p4-diff 检查当前 P4 环境并在 Codex 原生 Review 中查看差异。"
+  short_description: "按 Codex 会话隔离 P4 CL，并记录回合级差异"
+  default_prompt: "使用 $codex-p4-diff 检查当前 P4 会话 CL、审计记录，并在 Codex 原生 Review 中查看差异。"
