@@ -1,93 +1,102 @@
 # Codex P4 Diff
 
-Codex P4 Diff gives every writing Codex task its own Perforce pending changelist and records an immutable local audit event for every user turn. It also lets Codex's native **Review** page display changes from the task's changelist by mapping the selected files' Perforce `#have` revisions to an external Git baseline.
+Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
-The plugin does **not** copy the user's project into a fixed path. It discovers the active P4 client, server, user, client root, project root, changelist, tools, and safe local storage at runtime.
+- one Codex session becomes one `codex/session/<session-id>` branch;
+- one changed user turn becomes one automatic local Git commit;
+- Perforce is queried only for workspace and baseline metadata;
+- the history repository stays outside the P4 workspace, has no remote, and blocks push.
+
+The commit message contains the redacted request summary, session ID, turn ID, and changed paths. Each commit also includes an immutable `event.json` with file actions, before/after SHA-256 values, sizes, and read-only P4 metadata. Text changes include a unified patch.
 
 ## Install
 
 Prerequisites:
 
-- Codex Desktop or CLI with plugin support.
-- Python 3.10 or newer.
-- Perforce Helix Core CLI (`p4`) with a working login and client mapping.
+- Codex Desktop or CLI with plugin and Hook support;
+- Python 3.10 or newer;
+- Perforce Helix Core CLI (`p4`) with a working login and client mapping;
 - Git 2.x.
-- P4V is optional and only required for external `p4vc diffhave` / Beyond Compare behavior.
-
-Add this marketplace and install the plugin:
 
 ```powershell
 codex plugin marketplace add BillyCSZhao/codex-p4-diff
 codex plugin add codex-p4-diff@billycszhao-plugins
 ```
 
-Restart Codex, approve the plugin's Hooks review, open the P4 project, create a **new task**, and ask:
+Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
-> 检查当前 Codex 会话的 P4 changelist 和回合审计记录。
+## Behavior
 
-The plugin validates the P4 workspace when the task starts but creates no empty changelist. The first managed write lazily creates the task-specific pending changelist.
+At task start, the plugin creates an external history repository under:
 
-## Session changelists and turn audit
+```text
+%LOCALAPPDATA%\CodexP4Diff\History\<project-name-hash>
+```
 
-- One Codex `session_id` owns one lazily created pending changelist.
-- One user `turn_id` produces one local audit event with the request, file actions, before/after SHA-256 values, and sizes.
-- Text changes include a unified patch. Binary and large files record hashes and sizes without copying their content into the final audit event.
-- Audit data is stored outside the workspace under `%LOCALAPPDATA%\CodexP4Diff\Audit` on Windows.
-- The changelist description contains a redacted, truncated turn summary and a pointer to the local audit ledger. The full prompt is not uploaded to the Perforce server.
-- If another changelist already owns a target file, the plugin rejects the write before modification. It never silently runs `p4 reopen`.
-- Read-only tasks keep a local session ledger but do not create a changelist.
-- Session end never submits, shelves, reverts, or deletes the pending changelist.
+Every changed turn advances the task's session branch by one `[Codex]` commit. A no-change turn creates no empty commit. The external repository contains:
 
-## Native Review bridge
+```text
+files/<project-relative-path>        rolling small-file mirror
+turns/<sequence-turn-id>/event.json immutable turn details
+turns/<sequence-turn-id>/changes.patch exact text delta
+```
 
-- Creates an external sidecar under the current user's local application-data directory by default.
-- Creates or replaces a project-root `.git` **file** only when the existing slot is empty or already owned by Codex P4 Diff.
-- Builds a Git `HEAD` from the exact P4 `#have` revisions of files opened in the task changelist.
-- Uses the real P4 project as the Git worktree, so Review staging and restore operations directly affect real P4 files.
-- Installs Git hooks that reject Git commits and pushes. Submit through Perforce.
-- Optionally opens text files with `p4vc diffhave`; the user's configured P4V diff application remains in control.
+Files up to 8 MiB are eligible for the rolling mirror. Larger files are represented by hashes, sizes, and P4 metadata so repeated Unreal binary changes do not grow local Git history without bound. Set `CODEX_P4_DIFF_MAX_BLOB_BYTES` to change the threshold.
 
-The tool refuses to overwrite a real Git repository, an unknown `.git` pointer, a sidecar from another P4 server/client/user/changelist, or a `.git` path that is not ignored by Perforce. `--changelist auto` resolves the current task's managed changelist and verifies its server, client, project, and ownership markers.
+The first commit that touches an existing file shows the rolling mirror as a full-file addition because the branch did not previously contain that path. The same commit's `changes.patch` still contains the exact before/after text delta. Later commits show normal Git file diffs while the mirror matches the captured before state.
 
-## Troubleshooting
+## Perforce boundary
 
-Run the doctor from PowerShell when you need the full structured report:
+The runtime enforces this read-only P4 command whitelist:
+
+```text
+p4 info
+p4 where
+p4 fstat
+p4 diff
+p4 opened
+p4 print
+```
+
+The plugin never creates or edits P4 changelists, checks out files, reconciles, reopens, reverts, shelves, or submits. P4 file checkout and submission remain the responsibility of P4V, Unreal Source Control, or the user.
+
+File ownership conflicts between Codex sessions use a local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or move P4 changelist ownership.
+
+## View in GitHub Desktop
+
+Run the installed launcher to get the exact history path:
 
 ```powershell
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\scripts\run_codex_p4_diff.ps1" `
   --workspace "C:\path\to\p4-project" `
   --project-root "C:\path\to\p4-project" `
-  --changelist auto `
+  --history-path
+```
+
+Add the returned directory with **File > Add Local Repository**, then select the appropriate `codex/session/<session-id>` branch. Do not use **Publish repository**. The history repository has no remote and its `pre-push` hook rejects pushes.
+
+Because this Git repository is outside the P4 workspace, GitHub Desktop checkout, discard, and branch operations do not modify real P4 files.
+
+## Doctor and migration
+
+```powershell
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\scripts\run_codex_p4_diff.ps1" `
+  --workspace "C:\path\to\p4-project" `
+  --project-root "C:\path\to\p4-project" `
   --doctor
 ```
 
-`$SkillRoot` means the installed `skills/codex-p4-diff` directory. The Codex skill resolves it automatically; users normally do not need to type this command.
+Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, and `legacyGitPointer`.
 
-| Doctor check | Resolution |
-| --- | --- |
-| `python` missing or older than 3.10 | Install a current Python from python.org, make `python` or `py -3` available, then restart Codex. |
-| `p4` missing | Install Helix Core CLI/P4V and verify `p4 info` from the target project. |
-| P4 login/client error | Run `p4 login`, verify `P4CONFIG`/P4V connection, and ensure the project is mapped by the selected client. |
-| `git` missing | Install Git 2.x or pass the full executable path. |
-| `p4vc` warning | Native Review still works. Install P4V only if external Diff is wanted. |
-| Current task has no changelist | Complete one managed file write first, or pass an explicit numeric changelist. |
-| File is open in another changelist | Stop and coordinate ownership. The plugin intentionally refuses a silent `p4 reopen`. |
-| `opened-files` error | Verify the task changelist and confirm its files are open with `p4 edit`, `p4 add`, or `p4 delete`. |
-| `p4-ignore` error | Add `.git` to the active `P4IGNORE` file and verify with `p4 ignores -i -v <project>\.git`. |
-| Existing real Git repository | Do not overwrite it. Use only `--open-p4-diff` for that project. |
-| Sidecar identity mismatch | Omit `--sidecar` to use automatic isolation, or choose a new empty directory outside the P4 client root. |
-| Review is initially empty | Enable the bridge, create a new Codex task rooted at the same project, then open Review. Ensure the selected P4 files actually differ from `#have`. |
+Version 0.3 could attach a plugin-owned `.git` pointer to the P4 workspace and create P4 pending changelists. Version 0.4 stops all P4 mutations. At new-task startup it safely removes only a `.git` file pointing into the old Codex P4 Diff local-data directories. It does not remove a real Git repository, an unknown pointer, the old sidecar data, or any P4 changelist.
 
-On Windows, only if Codex reports `SetNamedSecurityInfoW failed: 5` or `sandbox setup refresh had errors` involving `C:\tmp`, add this to `%USERPROFILE%\.codex\config.toml`, restart Codex, and create a new task:
+To run only that migration manually:
 
-```toml
-[sandbox_workspace_write]
-exclude_slash_tmp = true
+```powershell
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\scripts\run_codex_p4_diff.ps1" `
+  --workspace "C:\path\to\p4-project" `
+  --detach-legacy-review
 ```
-
-Do not apply that setting for unrelated errors.
-
-To disconnect a project, ask Codex to disable Codex P4 Diff, or run the launcher with `--disable-native-review`. It removes only a `.git` pointer owned by this tool and leaves the external sidecar for audit/recovery.
 
 ## Update or remove
 
@@ -97,18 +106,18 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Restart Codex and create a new task after the reinstall. Existing tasks do not hot-load new skills or Hook definitions.
-
-To remove the plugin and marketplace:
+Restart Codex, approve the updated Hooks, and create a new task.
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
 codex plugin marketplace remove billycszhao-plugins
 ```
 
+Removing the plugin does not delete local history or old P4 changelists.
+
 ## Security and data handling
 
-The plugin executes local `p4`, `git`, and optionally P4V commands. It has no telemetry and does not send project content to a plugin-owned service. Its local audit ledger may contain full user prompts and text patches; see [PRIVACY.md](PRIVACY.md), [TERMS.md](TERMS.md), and [LICENSE](LICENSE).
+The plugin runs local `p4` and `git` commands. It has no telemetry and does not send project contents to a plugin-owned service. Prompt summaries and source-code patches remain in the local history repository; see [PRIVACY.md](PRIVACY.md), [TERMS.md](TERMS.md), and [LICENSE](LICENSE).
 
 ## Development
 
@@ -118,4 +127,4 @@ python -m unittest discover -s plugins/codex-p4-diff/tests -v
 python -m py_compile plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_diff.py plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_audit.py plugins/codex-p4-diff/hooks/codex_p4_session.py
 ```
 
-The tests use temporary directories and mocks; they do not connect to a live Perforce server.
+Tests use temporary directories and mocks; they do not mutate a Perforce server or workspace.

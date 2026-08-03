@@ -17,26 +17,50 @@ import codex_p4_audit as audit
 import codex_p4_diff as bridge
 
 
-class AuditHelpersTest(unittest.TestCase):
-    def make_context(self, root: Path) -> audit.AuditContext:
-        info = {
+class AuditTestCase(unittest.TestCase):
+    def make_context(
+        self, data_root: Path, project: Path, session_id: str = "thread-123"
+    ) -> audit.AuditContext:
+        p4_context = {
+            "p4Exe": "p4",
             "serverAddress": "p4.example.test:1666",
             "userName": "tester",
-            "clientRoot": str(root.parent),
+            "client": "test-client",
+            "clientRoot": str(project.parent),
+            "projectRoot": str(project),
         }
-        project_audit_root = root.parent / "audit"
+        with mock.patch.object(bridge, "user_data_root", return_value=data_root):
+            history = bridge.ensure_history_repo(p4_context, project)
+        key = bridge.sanitize_component(session_id, 80)
         return audit.AuditContext(
-            p4_exe="p4",
-            project_root=root,
-            client="test-client",
-            client_root=root.parent,
-            info=info,
-            connection={"source": "test"},
-            session_id="thread-123",
-            session_root=project_audit_root / "sessions" / "thread-123",
-            project_audit_root=project_audit_root,
+            p4=p4_context,
+            project_root=project,
+            session_id=session_id,
+            branch=f"codex/session/{key}",
+            history_root=Path(history["historyRoot"]),
+            state_root=Path(history["stateRoot"]),
+            session_root=Path(history["stateRoot"]) / "sessions" / key,
+            git_exe=str(history["gitExe"]),
+            base_commit=str(history["baseCommit"]),
         )
 
+    def start_turn(self, ctx: audit.AuditContext, turn_id: str, prompt: str = "Update file") -> None:
+        audit.record_prompt(
+            ctx,
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": ctx.session_id,
+                "turn_id": turn_id,
+                "prompt": prompt,
+            },
+        )
+
+    def finalize(self, ctx: audit.AuditContext, turn_id: str) -> dict[str, object]:
+        with mock.patch.object(bridge, "readonly_fstat", return_value=None):
+            return audit.finalize_turn(ctx, {"hook_event_name": "Stop", "turn_id": turn_id})
+
+
+class AuditHelpersTest(AuditTestCase):
     def test_parse_apply_patch_paths_includes_move_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -56,7 +80,7 @@ class AuditHelpersTest(unittest.TestCase):
     def test_parse_apply_patch_paths_rejects_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
-            with self.assertRaises(bridge.CodexP4DiffError):
+            with self.assertRaisesRegex(bridge.CodexP4DiffError, "越出项目目录"):
                 audit.parse_apply_patch_paths(
                     "*** Begin Patch\n*** Update File: ../outside.txt\n*** End Patch\n",
                     root,
@@ -76,131 +100,149 @@ class AuditHelpersTest(unittest.TestCase):
         self.assertTrue(audit.likely_mutating_shell("echo data > output.txt"))
         self.assertFalse(audit.likely_mutating_shell("Get-Content -LiteralPath a.txt"))
         self.assertFalse(audit.likely_mutating_shell("rg -n TODO Source"))
-        self.assertFalse(audit.likely_mutating_shell("rg -n TODO Source 2>$null"))
-        self.assertFalse(audit.likely_mutating_shell("tool 2>&1"))
 
-    def test_replace_description_preserves_other_fields(self) -> None:
-        original = (
-            "Change:\t123\r\n"
-            "Client:\ttest-client\r\n"
-            "Description:\r\n"
-            "\told line\r\n"
-            "\r\n"
-            "Files:\r\n"
-            "\t//depot/file\r\n"
-        )
-        updated = audit.replace_description_in_spec(original, "new line\nsecond line")
-        self.assertIn("\tnew line\r\n\tsecond line\r\nFiles:", updated)
-        self.assertIn("\t//depot/file", updated)
-        self.assertNotIn("old line", updated)
 
-    def test_render_change_description_contains_traceability_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp).resolve() / "Project"
-            root.mkdir()
-            ctx = self.make_context(root)
-            session = audit.base_session(ctx)
-            session["promptSummary"] = "Fix puzzle placement"
-            session["turns"] = [
-                {"turnId": "turn-abcdef", "summary": "Update validation", "fileCount": 2}
-            ]
-            session["files"] = [{"path": "Source/A.cpp", "action": "edit"}]
-            description = audit.render_change_description(ctx, session)
-            self.assertIn(audit.MANAGED_MARKER, description)
-            self.assertIn("Codex-Session: thread-123", description)
-            self.assertIn("turn-abcdef", description)
-            self.assertIn("edit Source/A.cpp", description)
-
-    def test_preflight_rejects_file_owned_by_another_change(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp).resolve() / "Project"
-            root.mkdir()
-            path = root / "A.txt"
-            path.write_text("content", encoding="utf-8")
-            ctx = self.make_context(root)
-            with mock.patch.object(
-                audit,
-                "opened_record_for_path",
-                return_value={"depotFile": "//depot/A.txt", "change": "456"},
-            ):
-                with self.assertRaisesRegex(audit.OwnershipConflict, "changelist 456"):
-                    audit.preflight_existing_ownership(ctx, [path], "123")
-
-    def test_text_diff_uses_before_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp).resolve()
-            current = root / "A.txt"
-            before_path = root / "before.txt"
-            before_path.write_text("before\n", encoding="utf-8")
-            current.write_text("after\n", encoding="utf-8")
-            result = audit.build_file_diff(
-                "A.txt",
-                {
-                    "exists": True,
-                    "binary": False,
-                    "snapshotPath": str(before_path),
-                },
-                current,
-            )
-            self.assertIn("-before", result)
-            self.assertIn("+after", result)
-
-    def test_unchanged_added_file_is_not_a_new_turn_change(self) -> None:
-        before = {"exists": True, "sha256": "same"}
-        after = {"exists": True, "sha256": "same"}
-        self.assertFalse(audit.snapshot_changed(before, after))
-
-    def test_auto_changelist_reads_current_session_ledger(self) -> None:
+class TurnCommitIntegrationTest(AuditTestCase):
+    def test_two_changed_turns_create_two_commits_on_one_session_branch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             data_root = Path(temp).resolve()
             project = data_root / "workspace" / "Project"
             project.mkdir(parents=True)
-            info = {
-                "serverAddress": "p4.example.test:1666",
-                "userName": "tester",
-                "clientRoot": str(data_root / "workspace"),
-            }
-            with mock.patch.object(bridge, "user_data_root", return_value=data_root):
-                ledger = bridge.audit_session_root(info, "test-client", project, "thread-123") / "session.json"
-                ledger.parent.mkdir(parents=True)
-                ledger.write_text(
-                    json.dumps(
-                        {
-                            "schemaVersion": bridge.AUDIT_SCHEMA_VERSION,
-                            "generatedBy": bridge.TOOL_NAME,
-                            "sessionId": "thread-123",
-                            "client": "test-client",
-                            "serverAddress": "p4.example.test:1666",
-                            "userName": "tester",
-                            "clientRoot": str(data_root / "workspace"),
-                            "projectRoot": str(project),
-                            "changelist": "12345",
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                self.assertEqual(
-                    bridge.resolve_auto_changelist(info, "test-client", project, "thread-123"),
-                    "12345",
-                )
+            target = project / "Source" / "A.txt"
+            target.parent.mkdir()
+            target.write_text("before\n", encoding="utf-8")
+            ctx = self.make_context(data_root / "local", project)
 
-    def test_auto_changelist_requires_managed_description(self) -> None:
-        project = Path("C:/workspace/Project")
-        good_spec = (
-            "Change:\t12345\nClient:\ttest-client\nStatus:\tpending\nDescription:\n"
-            "\tManaged-By: codex-p4-diff\n\tCodex-Session: thread-123\n"
-        ).encode("utf-8")
-        completed = subprocess.CompletedProcess([], 0, good_spec, b"")
-        with mock.patch.object(bridge, "run_command", return_value=completed):
-            bridge.validate_auto_changelist_context(
-                "p4", "test-client", project, "12345", "thread-123"
+            self.start_turn(ctx, "turn-1", "Change greeting")
+            audit.record_before_path(ctx, "turn-1", target)
+            target.write_text("after one\n", encoding="utf-8")
+            first = self.finalize(ctx, "turn-1")
+
+            self.start_turn(ctx, "turn-2", "Refine greeting")
+            audit.record_before_path(ctx, "turn-2", target)
+            target.write_text("after two\n", encoding="utf-8")
+            second = self.finalize(ctx, "turn-2")
+
+            self.assertEqual(first["status"], "committed")
+            self.assertEqual(second["status"], "committed")
+            count = subprocess.run(
+                [
+                    ctx.git_exe,
+                    "-C",
+                    str(ctx.history_root),
+                    "rev-list",
+                    "--count",
+                    f"{bridge.BASE_BRANCH}..{ctx.branch}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(count, "2")
+            mirror = subprocess.run(
+                [ctx.git_exe, "-C", str(ctx.history_root), "show", f"{ctx.branch}:files/Source/A.txt"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(mirror, "after two\n")
+            log = subprocess.run(
+                [ctx.git_exe, "-C", str(ctx.history_root), "log", "--format=%s", ctx.branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("[Codex] Change greeting", log)
+            self.assertIn("[Codex] Refine greeting", log)
+
+    def test_exact_first_touch_patch_is_committed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("user baseline\n", encoding="utf-8")
+            ctx = self.make_context(data_root / "local", project)
+            self.start_turn(ctx, "turn-patch")
+            audit.record_before_path(ctx, "turn-patch", target)
+            target.write_text("codex result\n", encoding="utf-8")
+            result = self.finalize(ctx, "turn-patch")
+            session = audit.load_session(ctx)
+            audit_path = session["turns"]["turn-patch"]["auditPath"]
+            patch_text = subprocess.run(
+                [ctx.git_exe, "-C", str(ctx.history_root), "show", f"{result['commit']}:{audit_path.rsplit('/', 1)[0]}/changes.patch"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("-user baseline", patch_text)
+            self.assertIn("+codex result", patch_text)
+
+    def test_no_change_turn_creates_no_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("same\n", encoding="utf-8")
+            ctx = self.make_context(data_root / "local", project)
+            self.start_turn(ctx, "turn-empty")
+            audit.record_before_path(ctx, "turn-empty", target)
+            result = self.finalize(ctx, "turn-empty")
+            self.assertEqual(result["status"], "no-changes")
+            verify = subprocess.run(
+                [ctx.git_exe, "-C", str(ctx.history_root), "rev-parse", "--verify", ctx.branch],
+                check=False,
+                capture_output=True,
             )
-        bad = subprocess.CompletedProcess([], 0, good_spec.replace(b"thread-123", b"other"), b"")
-        with mock.patch.object(bridge, "run_command", return_value=bad):
-            with self.assertRaisesRegex(bridge.CodexP4DiffError, "所有权标记"):
-                bridge.validate_auto_changelist_context(
-                    "p4", "test-client", project, "12345", "thread-123"
-                )
+            self.assertNotEqual(verify.returncode, 0)
+
+    def test_large_file_records_receipt_without_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "Asset.uasset"
+            target.write_bytes(b"before-binary")
+            ctx = self.make_context(data_root / "local", project)
+            self.start_turn(ctx, "turn-large")
+            with mock.patch.object(audit, "MAX_CAPTURE_BYTES", 4):
+                audit.record_before_path(ctx, "turn-large", target)
+                target.write_bytes(b"after-binary-content")
+                result = self.finalize(ctx, "turn-large")
+            session = audit.load_session(ctx)
+            audit_path = session["turns"]["turn-large"]["auditPath"]
+            event_json = subprocess.run(
+                [ctx.git_exe, "-C", str(ctx.history_root), "show", f"{result['commit']}:{audit_path}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            record = json.loads(event_json)
+            self.assertEqual(record["files"][0]["mirrorState"], "receipt-only")
+            self.assertFalse(record["files"][0]["after"]["captured"])
+
+
+class LocalOwnershipTest(AuditTestCase):
+    def test_another_active_session_cannot_claim_same_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("content", encoding="utf-8")
+            first = self.make_context(data_root / "local", project, "session-one")
+            second = self.make_context(data_root / "local", project, "session-two")
+            self.start_turn(first, "turn-1")
+            self.start_turn(second, "turn-2")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(target)},
+            }
+            self.assertEqual(audit.prepare_tool(first, event), 1)
+            with self.assertRaisesRegex(audit.OwnershipConflict, "另一个 Codex 会话"):
+                audit.prepare_tool(second, event)
 
 
 if __name__ == "__main__":

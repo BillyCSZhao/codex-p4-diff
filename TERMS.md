@@ -4,8 +4,10 @@ Effective date: 2026-08-03
 
 Codex P4 Diff is provided under the MIT License and without warranty.
 
-The plugin creates task-specific pending changelists, opens or reconciles files in the user's real Perforce workspace, and lets Codex's native Review staging and restore operations act on those files. Users are responsible for reviewing commands, Hook permissions, workspace mappings, changelist ownership, local audit retention, backups, and Perforce operations before changing or reverting files.
+The plugin records Codex changes in an external local Git repository and uses read-only Perforce queries for workspace and baseline metadata. Users remain responsible for Perforce checkout, changelist ownership, reviews, backups, and submission through their organization's normal tools and policies.
 
-Git commit and push hooks are installed as a safety guard, but Perforce remains the authoritative submission system. The plugin does not automatically submit, shelve, revert, or delete pending changelists. Users must review and submit changes through their organization's normal Perforce process.
+The local history repository contains source-code audit material. It is created without a remote and with a `pre-push` hook, but users remain responsible for protecting, retaining, or deleting that local data and for not publishing it accidentally.
 
-By installing or using the plugin, the user accepts these terms and the terms that apply to Codex, GitHub, Perforce, Git, P4V, and any configured external diff tool.
+Hook-based path detection cannot guarantee a write-before snapshot for tools that bypass Codex Tool Hooks or hide their output paths. Such changes may be represented by hashes and receipts rather than exact patches.
+
+By installing or using the plugin, the user accepts these terms and the terms that apply to Codex, GitHub, Perforce, and Git.

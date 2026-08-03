@@ -1,5 +1,5 @@
 {
-  "description": "Create one pending Perforce changelist per Codex session and record turn-level audit details.",
+  "description": "Create one local Git branch per Codex session and one commit per changed user turn without modifying Perforce.",
   "hooks": {
     "SessionStart": [
       {
@@ -9,7 +9,7 @@
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 30,
-            "statusMessage": "Checking Perforce session ownership",
+            "statusMessage": "Preparing local session history",
             "additionalContextLimit": 500
           }
         ]
@@ -23,7 +23,7 @@
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 120,
-            "statusMessage": "Preparing Perforce turn audit",
+            "statusMessage": "Preparing local turn snapshot",
             "additionalContextLimit": 500
           }
         ]
@@ -31,14 +31,14 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(Bash|apply_patch|Edit|Write)$",
+        "matcher": "^(Bash|shell_command|apply_patch|Edit|Write)$",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 180,
-            "statusMessage": "Assigning files to the Codex changelist",
+            "statusMessage": "Capturing files before the Codex write",
             "additionalContextLimit": 500
           }
         ]
@@ -46,14 +46,14 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Bash|apply_patch|Edit|Write)$",
+        "matcher": "^(Bash|shell_command|apply_patch|Edit|Write)$",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 180,
-            "statusMessage": "Recording Perforce file changes",
+            "statusMessage": "Recording local file changes",
             "additionalContextLimit": 500
           }
         ]
@@ -67,7 +67,7 @@
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 180,
-            "statusMessage": "Finalizing Perforce turn audit",
+            "statusMessage": "Committing the local turn history",
             "additionalContextLimit": 500
           }
         ]
@@ -80,8 +80,8 @@
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
-            "timeout": 3,
-            "statusMessage": "Closing Perforce session audit"
+            "timeout": 30,
+            "statusMessage": "Closing local session history"
           }
         ]
       }

@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex P4 Diff"
-  short_description: "按 Codex 会话隔离 P4 CL，并记录回合级差异"
-  default_prompt: "使用 $codex-p4-diff 检查当前 P4 会话 CL、审计记录，并在 Codex 原生 Review 中查看差异。"
+  short_description: "会话级本地 Git 分支，回合级自动 commit"
+  default_prompt: "使用 $codex-p4-diff 检查当前会话的本地 Git 分支和回合 commit，并确认 P4 仅被只读查询。"

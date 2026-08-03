@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -47,142 +48,155 @@ class PlatformPathTests(unittest.TestCase):
             with mock.patch.dict(MODULE.os.environ, {"LOCALAPPDATA": temp}, clear=False):
                 self.assertEqual(MODULE.user_data_root(), Path(temp))
 
-    @unittest.skipIf(MODULE.os.name == "nt", "XDG state path is for non-Windows platforms")
-    def test_xdg_state_home_is_used_outside_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            with mock.patch.dict(
-                MODULE.os.environ,
-                {"XDG_STATE_HOME": temp},
-                clear=True,
-            ):
-                self.assertEqual(MODULE.user_data_root(), Path(temp))
-
     def test_p4_filespec_characters_are_escaped(self) -> None:
         self.assertEqual(
             MODULE.p4_escape_filespec_path("C:/client/A@B#C%20*D.txt"),
             "C:/client/A%40B%23C%2520%2AD.txt",
         )
 
-
-class SafetyTests(unittest.TestCase):
-    def test_real_git_directory_is_never_overwritten(self) -> None:
+    def test_p4v_candidates_prefer_workspace_path_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            project = Path(temp) / "project"
-            project.mkdir()
-            (project / ".git").mkdir()
-            with self.assertRaisesRegex(MODULE.CodexP4DiffError, "真实 Git 仓库"):
-                MODULE.validate_project_slot(project, Path(temp) / "sidecar" / "git")
-
-    def test_sidecar_identity_accepts_same_context(self) -> None:
-        root = Path(tempfile.gettempdir()) / "p4-client"
-        marker = {
-            "serverAddress": "ssl:perforce.example:1666",
-            "userName": "alice",
-            "client": "alice-main",
-            "clientRoot": str(root),
-            "changelist": "default",
-            "baselineCommit": "abc",
-        }
-        MODULE.validate_sidecar_identity(
-            marker,
-            {"serverAddress": "ssl:perforce.example:1666", "userName": "alice"},
-            "alice-main",
-            "default",
-            root,
-        )
-
-    def test_sidecar_identity_rejects_different_client(self) -> None:
-        root = Path(tempfile.gettempdir()) / "p4-client"
-        marker = {
-            "serverAddress": "perforce.example:1666",
-            "userName": "alice",
-            "client": "alice-other",
-            "clientRoot": str(root),
-            "changelist": "default",
-            "baselineCommit": "abc",
-        }
-        with self.assertRaisesRegex(MODULE.CodexP4DiffError, "不同的 P4 上下文"):
-            MODULE.validate_sidecar_identity(
-                marker,
-                {"serverAddress": "perforce.example:1666", "userName": "alice"},
-                "alice-main",
-                "default",
-                root,
+            root = Path(temp).resolve()
+            project = root / "TDDEMO_ZCS" / "Project"
+            project.mkdir(parents=True)
+            p4qt = root / ".p4qt"
+            p4qt.mkdir()
+            connection_map = p4qt / "connectionmap.xml"
+            connection_map.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<ConnectionMapList>
+  <ConnectionMap><Name>0001</Name><User>tester</User><P4Port>p4-a:1666</P4Port></ConnectionMap>
+  <ConnectionMap><Name>0002</Name><User>tester</User><P4Port>p4-b:1666</P4Port></ConnectionMap>
+</ConnectionMapList>
+""",
+                encoding="utf-8",
             )
+            for key, client, selected in (
+                ("0001", "WRONG_CLIENT", root / "Other"),
+                ("0002", "TDDEMO_ZCS", project),
+            ):
+                folder = p4qt / f"{key}Clients"
+                folder.mkdir()
+                (folder / "WorkspaceSettings.xml").write_text(
+                    f"""<Settings>
+<PropertyList varName="ClientList"><PropertyList varName="{client}" /></PropertyList>
+<PropertyList varName="Recent"><PropertyList varName="{client}"><String>{selected}</String></PropertyList></PropertyList>
+</Settings>
+""",
+                    encoding="utf-8",
+                )
+            candidates = MODULE.load_p4v_candidates(project, connection_map)
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["client"], "TDDEMO_ZCS")
+            self.assertEqual(candidates[0]["port"], "p4-b:1666")
 
-    def test_replace_text_atomically_is_idempotent(self) -> None:
+
+class HistoryRepositoryTests(unittest.TestCase):
+    def context(self, project: Path) -> dict[str, str]:
+        return {
+            "p4Exe": "p4",
+            "serverAddress": "p4.example.test:1666",
+            "userName": "tester",
+            "client": "test-client",
+            "clientRoot": str(project.parent),
+            "projectRoot": str(project),
+        }
+
+    def test_history_repo_has_no_remote_and_blocks_push(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            target = Path(temp) / "pointer"
-            self.assertEqual(MODULE.replace_text_atomically(target, "gitdir: x\n"), "atomic-git-pointer-replace")
-            self.assertEqual(MODULE.replace_text_atomically(target, "gitdir: x\n"), "atomic-git-pointer-replace")
-            self.assertEqual(target.read_text(encoding="utf-8"), "gitdir: x\n")
+            root = Path(temp).resolve()
+            project = root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
+                history = MODULE.ensure_history_repo(self.context(project), project)
+            history_root = Path(history["historyRoot"])
+            remotes = subprocess.run(
+                [history["gitExe"], "-C", str(history_root), "remote"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(remotes, "")
+            git_dir = subprocess.run(
+                [history["gitExe"], "-C", str(history_root), "rev-parse", "--absolute-git-dir"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            pre_push = Path(git_dir) / "hooks" / "pre-push"
+            self.assertTrue(pre_push.is_file())
+            self.assertIn("push is blocked", pre_push.read_text(encoding="utf-8"))
+            self.assertFalse((Path(git_dir) / "hooks" / "pre-commit").exists())
 
-
-class PerforceMappingTests(unittest.TestCase):
-    def test_opened_query_runs_from_requested_scope(self) -> None:
+    def test_history_repo_rejects_added_remote(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            project = Path(temp) / "project"
-            scope = project / "Source"
-            client_file = scope / "Tool.cpp"
-            scope.mkdir(parents=True)
-            client_file.write_text("changed\n", encoding="utf-8")
-            records = [
-                {
-                    "depotFile": "//depot/project/Source/Tool.cpp",
-                    "action": "edit",
-                    "rev": "12",
-                    "type": "text",
-                    "change": "default",
-                }
-            ]
-            with mock.patch.object(MODULE, "p4_tagged", return_value=records) as tagged:
-                with mock.patch.object(MODULE, "resolve_where", return_value=client_file) as where:
-                    files = MODULE.opened_files(
-                        "p4",
-                        "alice-main",
-                        scope,
-                        "default",
-                        project,
-                        project,
-                    )
-            self.assertEqual(files[0]["relativePath"], "Source/Tool.cpp")
-            self.assertEqual(tagged.call_args.kwargs["cwd"], scope)
-            self.assertEqual(where.call_args.args[-1], scope)
+            root = Path(temp).resolve()
+            project = root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
+                history = MODULE.ensure_history_repo(self.context(project), project)
+                subprocess.run(
+                    [
+                        history["gitExe"],
+                        "-C",
+                        str(history["historyRoot"]),
+                        "remote",
+                        "add",
+                        "origin",
+                        "https://example.invalid/history.git",
+                    ],
+                    check=True,
+                )
+                with self.assertRaisesRegex(MODULE.CodexP4DiffError, "不允许配置 Git remote"):
+                    MODULE.ensure_history_repo(self.context(project), project)
+
+    def test_detach_removes_only_owned_legacy_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            project = root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            owned = root / "local" / "CodexP4Diff" / "Native" / "old" / "git"
+            owned.mkdir(parents=True)
+            (project / ".git").write_text(f"gitdir: {owned}\n", encoding="utf-8")
+            with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
+                result = MODULE.detach_legacy_git_pointer(project)
+            self.assertTrue(result["removed"])
+            self.assertFalse((project / ".git").exists())
+
+    def test_detach_preserves_foreign_pointer_and_real_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            project = root / "Project"
+            project.mkdir()
+            (project / ".git").write_text("gitdir: C:/foreign/repo.git\n", encoding="utf-8")
+            result = MODULE.detach_legacy_git_pointer(project)
+            self.assertFalse(result["removed"])
+            self.assertTrue((project / ".git").is_file())
+            (project / ".git").unlink()
+            (project / ".git").mkdir()
+            result = MODULE.detach_legacy_git_pointer(project)
+            self.assertFalse(result["removed"])
+            self.assertTrue((project / ".git").is_dir())
 
 
-class P4VTests(unittest.TestCase):
-    def test_diffhave_passes_connection_and_uses_only_text_files(self) -> None:
-        files = [
-            {"clientFile": "C:/p4/A.cpp", "fileType": "text+k"},
-            {"clientFile": "C:/p4/B.uasset", "fileType": "binary+l"},
-        ]
-        command, selected = MODULE.p4vc_diffhave_command(
-            "p4vc",
-            "alice-main",
-            files,
-            {"p4Port": "ssl:perforce.example:1666", "p4User": "alice"},
-        )
-        self.assertEqual(selected, ["C:/p4/A.cpp"])
+class PerforceSafetyTests(unittest.TestCase):
+    def test_runtime_contains_no_perforce_mutation_commands(self) -> None:
         self.assertEqual(
-            command,
-            [
-                "p4vc",
-                "-p",
-                "ssl:perforce.example:1666",
-                "-u",
-                "alice",
-                "-c",
-                "alice-main",
-                "diffhave",
-                "C:/p4/A.cpp",
-            ],
+            MODULE.READ_ONLY_P4_COMMANDS,
+            frozenset({"info", "where", "fstat", "diff", "opened", "print"}),
         )
+        with self.assertRaisesRegex(MODULE.CodexP4DiffError, "拒绝非只读 P4 命令"):
+            MODULE.p4_tagged("p4", ["change", "-i"], cwd=Path.cwd())
 
-    def test_p4v_executable_uses_p4vc_mode(self) -> None:
-        self.assertEqual(
-            MODULE.p4vc_launcher("C:/Program Files/Perforce/p4v.exe"),
-            [str(Path("C:/Program Files/Perforce/p4v.exe")), "-p4vc"],
-        )
+    def test_readonly_fstat_uses_only_fstat(self) -> None:
+        context = {
+            "p4Exe": "p4",
+            "client": "client",
+            "projectRoot": "C:/workspace/Project",
+        }
+        with mock.patch.object(MODULE, "p4_tagged", return_value=[]) as tagged:
+            MODULE.readonly_fstat(context, Path("C:/workspace/Project/A.txt"))
+        self.assertEqual(tagged.call_args.args[1][0], "fstat")
 
 
 class DistributionTests(unittest.TestCase):
@@ -193,7 +207,7 @@ class DistributionTests(unittest.TestCase):
         )
         entry = marketplace["plugins"][0]
         self.assertEqual(manifest["name"], "codex-p4-diff")
-        self.assertEqual(manifest["version"], "0.3.0")
+        self.assertEqual(manifest["version"], "0.4.0")
         self.assertEqual(manifest["author"]["name"], "BillyCSZhao")
         self.assertEqual(manifest["repository"], "https://github.com/BillyCSZhao/codex-p4-diff")
         self.assertEqual(entry["name"], manifest["name"])

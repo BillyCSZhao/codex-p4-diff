@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plugin hook entry point for Codex P4 session changelist tracking."""
+"""Plugin hook entry point for local Codex turn history."""
 
 from __future__ import annotations
 

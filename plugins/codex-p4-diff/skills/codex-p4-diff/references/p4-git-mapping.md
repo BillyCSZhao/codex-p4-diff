@@ -1,123 +1,97 @@
-# P4 与 Git 映射及故障排查
+# 本地 Git 历史架构及故障排查
 
-## 文件状态
-
-| P4 操作 | Git `HEAD` 基线 | 真实工作树 | 原生 Review |
-| --- | --- | --- | --- |
-| `edit` | `depotFile#haveRev` | `clientFile` | 已修改或无内容差异 |
-| `add` | 无 | `clientFile`，intent-to-add | 新增 |
-| `delete` | `depotFile#haveRev` | 文件不存在 | 已删除 |
-| `move/delete` | `depotFile#haveRev` | 文件不存在 | 删除/重命名源 |
-| `move/add` | 无 | `clientFile`，intent-to-add | 新增/重命名目标 |
-| `integrate` / `branch` | 有 `haveRev` 时使用 | `clientFile` | 已修改 |
-
-只跟踪目标 P4 变更列表的文件，并设置 `status.showUntrackedFiles=no`。
-
-## Review 拓扑
+## 存储拓扑
 
 ~~~text
-<P4 ProjectRoot>
-├─ .git  ->  gitdir: <sidecar>/git
-└─ 真实 P4 文件
+<P4 ProjectRoot>/                    # 真实工作区，不放置 Git 元数据
 
-<sidecar>/git
-├─ HEAD -> refs/heads/codex-p4-have
-├─ index
-├─ codex-p4-diff.json
-└─ hooks/{pre-commit,pre-push}
+%LOCALAPPDATA%/CodexP4Diff/
+├─ History/<project-name-hash>/      # 可添加到 GitHub Desktop 的本地 Git 仓库
+│  ├─ .git/
+│  ├─ .codex-p4-diff/project.json
+│  ├─ files/<project-relative-path>  # 小文件的滚动镜像
+│  └─ turns/<sequence-turn-id>/
+│     ├─ event.json                  # 摘要、动作、哈希、大小、P4 只读元数据
+│     └─ changes.patch               # 精确的本回合文本补丁
+└─ State/<project-name-hash>/
+   ├─ ownership.json                 # 跨会话本地路径所有权
+   └─ sessions/<session-id>/
+      ├─ session.json
+      └─ turns/<turn-id>/            # commit 前的临时快照和重试状态
 ~~~
 
-`git rev-parse --show-toplevel` 必须等于项目根；`--absolute-git-dir` 必须位于 P4 client root 外。
+项目键由 P4 server、client 和项目绝对路径共同生成。历史仓库与真实工作区没有 `.git` 连接，因此 GitHub Desktop 的分支切换或丢弃操作不会修改 P4 文件。
 
-## 会话审计拓扑
+## Commit 拓扑
+
+`codex/base` 只包含一次初始化记录。每个会话分支从它开始：
 
 ~~~text
-%LOCALAPPDATA%/CodexP4Diff/Audit/<client-server>/<project>/
-└─ sessions/<session_id>/
-   ├─ session.json                 # 会话与 pending CL 的稳定绑定
-   └─ turns/<turn_id>/
-      ├─ prompt.txt                # 仅本机保存的原始需求
-      ├─ prompt.json               # 摘要与哈希
-      ├─ before.json               # 回合前文件状态
-      ├─ event.json                # 文件动作、前后哈希和 P4 元数据
-      ├─ changes.patch             # 可解码文本的 unified diff
-      └─ tools/*.json              # apply_patch / shell 工具归属记录
+codex/base
+  └─ [Codex] turn 1
+       └─ [Codex] turn 2
+            └─ [Codex] turn 3
 ~~~
 
-`session_id` 对应一个 pending CL，`turn_id` 对应一条不可变审计事件。CL Description 只保留脱敏摘要和审计路径，不把完整 prompt 上传到 P4 Server。
+每个有变化的回合只创建一个 `[Codex]` commit。无变化回合写入本地会话状态但不创建空 commit。
 
-同一 client 中一个文件只能归属一个 CL。另一个 Codex 会话命中已打开文件时默认拒绝；pending CL 本身不保存逐回合内容，因此不能用连续 `p4 reopen` 代替回合补丁。
+首次接触一个已有文件时，`files/...` 在 Git 中表现为新增完整文件，因为分支父提交尚无该文件；同一 commit 的 `turns/.../changes.patch` 始终保存精确的写入前后文本差异。后续回合在镜像状态与写入前状态一致时显示普通 Git 文件 Diff。若文件在回合之间被外部修改，插件不把外部变化冒充 Codex 修改，而把镜像标记为 `drifted-receipt-only`，以补丁和哈希作为审计依据。
 
-## 自动发现
+## 大文件和二进制
 
-- `p4`：显式路径、PATH、Windows 标准 Perforce 目录。
-- Git：显式路径、PATH、Windows 标准 Git 目录、Codex Desktop 捆绑 Git。
-- P4V：显式路径、PATH、Windows 标准 Perforce 目录；接受 `p4vc.bat` 或 `p4v.exe`。
-- P4 连接：在 `--workspace` 目录运行 `p4 info` 以加载 P4CONFIG；失败后只读扫描 `~/.p4qt/connectionmap.xml`。
-- 多个 server/client 匹配时拒绝猜测。
-- 已完成 sidecar 校验 server、user、client、client root 和 changelist，拒绝跨上下文复用。
-- 会话 Hook 使用相同的连接/client 解析，不直接信任 shell 中可能指向其他 workspace 的 `P4CLIENT`。
+- 默认阈值为 8 MiB。
+- 阈值以内的文件可写入 `files/...` 镜像；GitHub Desktop 对二进制显示 binary changed。
+- 超过阈值的文件只在 `event.json` 保存前后 SHA-256、大小和 P4 元数据，不把完整资产写入 Git 对象库。
+- 设置 `CODEX_P4_DIFF_MAX_BLOB_BYTES` 可调整阈值。降低阈值可以限制 Unreal 资产历史增长。
 
-## Git 操作语义
+## P4 只读保证
 
-- 暂存只修改 sidecar index。
-- Review 还原会写入/删除真实 P4 文件，P4 元数据不会自动同步。
-- Git commit/push 由 sidecar 的 pre-commit/pre-push hooks 拦截；sidecar 默认也不配置 remote。
-- 还原后只用 `p4 revert -a` 清理等于 `#have` 的文件。
+运行时代码用白名单拒绝非只读 P4 命令。允许集合固定为：
 
-## 基线刷新
-
-真实文件内容变化不重建基线。P4 打开集合、目标 CL 或 `#have` 改变时重建。若 Git 已暂存、存在未合并项或 `HEAD` 偏离 marker，默认停止；确认后才使用 `--discard-git-review-state`。
-
-成功后原子重写项目内工具拥有的 `.git` 指针，产生项目目录事件以提示 Review 扫描新的 `HEAD` 和 index。
-
-`--changelist auto` 从当前 `CODEX_THREAD_ID` 的 `session.json` 读取数字 CL，并校验 server、client 和项目根。账本不存在或上下文不一致时停止，不回退到 `default`。
-
-## Troubleshooting
-
-### Python
-
-Windows 使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File run_codex_p4_diff.ps1`；macOS/Linux 使用 `sh run_codex_p4_diff.sh`。启动器要求 Python 3.10+，失败时会给出安装提示。
-
-### 找不到 p4 / Git / P4V
-
-运行 `--doctor` 查看解析路径。安装 Helix Core CLI 与 Git；P4V 仅为外部 Diff 所需。也可传 `--p4`、`--git`、`--p4vc` 完整路径。
-
-### 没有已打开文件
-
-`--enable-native-review` 拒绝生成空 Review。用 `p4 opened -c <CL> <scope>/...` 核对 workspace、client 和 changelist。
-
-### P4 未忽略 .git
-
-在当前 P4IGNORE 中加入 `.git`，再运行 `p4 ignores -i -v '<ProjectRoot>\.git'`。插件不会自动修改全局 P4IGNORE。
-
-### 项目已有 Git
-
-插件拒绝覆盖真实 `.git`。保留现有 Git，只使用 `--open-p4-diff`；不要删除真实 Git 来迁就插件。
-
-### Review 为空或延迟
-
-确认目标为 **未暂存**；检查 `visibleGitChangeCount` 和 `gitStatus`；首次启用/升级后用 `newTaskUrl` 新建任务；P4 文件集合变化后重新启用。
-
-### Windows sandbox refresh / C:\tmp ACL
-
-只有日志同时出现 `SetNamedSecurityInfoW failed: 5`、`C:\tmp` 和 `sandbox setup refresh` 时，才在 `~/.codex/config.toml` 添加：
-
-~~~toml
-[sandbox_workspace_write]
-exclude_slash_tmp = true
+~~~text
+p4 info
+p4 where
+p4 fstat
+p4 diff
+p4 opened
+p4 print
 ~~~
 
-保存后新建任务。不要把它当作通用 Review 修复。
+插件不创建或更新 P4 changelist，不 checkout 文件，不 reconcile，不 reopen，不 revert，不 shelve，也不 submit。旧版插件创建的 pending CL 不会自动迁移或删除；由用户继续在 P4V 中处理。
 
-### sidecar/权限
+## GitHub Desktop
 
-自定义 sidecar 必须可写、为空或由插件标记，并位于 P4 client root 外；不要多人共享 sidecar。
+1. 运行 `--history-path` 获取目录。
+2. 在 GitHub Desktop 选择 **File > Add Local Repository** 并选择该目录。
+3. 从 **Current Branch** 选择 `codex/session/<session-id>`。
+4. 从 History 查看 `[Codex]` commit；打开 `event.json` 查看详情，打开 `changes.patch` 查看首触或漂移文件的精确差异。
 
-### Hook 未触发
+历史仓库没有 remote。不要使用 Publish repository；`pre-push` 也会拒绝 push。
 
-插件 Hooks 在安装或定义变化后需要重新信任，并从新任务加载。检查 Codex Hooks 页面中 `codex-p4-diff/hooks/hooks.json` 的状态。旧任务不会自动获得新 Hook。
+## 迁移旧版 0.3
 
-### Shell 写入与专用工具
+0.3 可能在项目根创建 `.git` 指针并把文件放入 P4 pending CL。0.4 的 `SessionStart` 会删除且只删除指向 `%LOCALAPPDATA%\CodexP4Diff\Native`、`Sidecars` 或旧 `Audit` 目录的 `.git` 文件，不删除目标目录，也不修改 P4 文件或 CL。
 
-`apply_patch` 可以在写入前精确解析文件并建立归属。对明确的写入型 shell 命令，Hook 会在执行前确认不存在未归属 workspace 漂移，并在执行后 reconcile。少数专用工具可能绕过通用 Tool Hooks；发现这种写入时停止并报告，不要事后吞并已有改动。
+若自动迁移没有运行，执行 `--detach-legacy-review`。真实 `.git` 目录、未知 `.git` 文件和外部 Git 指针都保持不变并报告原因。
+
+## 常见问题
+
+### doctor 显示 `ready=false`
+
+按 `checks[].hint` 修复。常见原因是 P4 登录失效、项目未映射、Git 缺失、历史仓库被添加 remote，或仍存在旧版 `.git` 指针。
+
+### 回合结束没有 commit
+
+先确认本回合确实改变了 Hook 在写入前识别到的文件。无文件变化不会创建空 commit。插件升级后必须重启 Codex、信任新版 Hooks 并新建任务；旧任务不会热加载 Hook。
+
+### shell 命令修改了文件但没有精确补丁
+
+优先让 Codex 使用 `apply_patch`、`Edit`、`Write`，或在 shell 命令中传入明确文件路径。通用 Hook 无法可靠推断不透明脚本在运行后内部选择的所有路径；执行后才发现的路径只记录收据，不能伪造写入前快照。
+
+### 同一路径被另一个会话锁定
+
+结束原 Codex 会话以触发 `SessionEnd`。异常退出留下的所有权记录在 24 小时后视为过期。不要通过 P4 reopen 解决，因为冲突记录完全是本地 Codex 会话状态。
+
+### commit 失败
+
+真实 P4 工作区修改保持不变。修复 `event.json` 中报告的 Git/权限/remote 问题后重试回合收尾。不要删除 `State/.../sessions`，其中包含重试所需的写入前快照。
