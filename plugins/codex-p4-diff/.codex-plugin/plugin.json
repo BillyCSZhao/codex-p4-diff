@@ -1,7 +1,7 @@
 {
   "name": "codex-p4-diff",
-  "version": "0.2.0",
-  "description": "把 Perforce #have 基线接入真实工作区，在 Codex 原生 Review 中查看差异，并可调用本机 P4V Diff。",
+  "version": "0.3.0",
+  "description": "\u6309 Codex \u4f1a\u8bdd\u9694\u79bb Perforce pending changelist\uff0c\u8bb0\u5f55\u56de\u5408\u7ea7\u4fee\u6539\u8be6\u60c5\uff0c\u5e76\u628a #have \u57fa\u7ebf\u63a5\u5165\u539f\u751f Review\u3002",
   "author": {
     "name": "BillyCSZhao",
     "url": "https://github.com/BillyCSZhao"
@@ -13,14 +13,17 @@
     "perforce",
     "p4",
     "diff",
+    "changelist",
+    "audit",
+    "hooks",
     "code-review",
     "codex"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex P4 Diff",
-    "shortDescription": "检查环境并用原生 Review 审阅真实 P4 差异。",
-    "longDescription": "先诊断 Python、P4、Git、P4V、P4 映射、忽略规则和目录权限，再以 P4 #have 为 Git 基线，把外置 Git 元数据连接到当前真实 P4 工作区，使 Codex 原生 Review 显示未暂存和已暂存差异。Git 暂存与还原会直接作用于真实 P4 文件；Git 提交被禁用，正式提交继续使用 Perforce。",
+    "shortDescription": "\u6309 Codex \u4f1a\u8bdd\u9694\u79bb P4 CL\uff0c\u5e76\u8bb0\u5f55\u56de\u5408\u7ea7\u5dee\u5f02\u3002",
+    "longDescription": "\u4f7f\u7528 Codex \u751f\u547d\u5468\u671f Hooks \u4e3a\u6bcf\u4e2a\u53d1\u751f\u5199\u5165\u7684\u4f1a\u8bdd\u61d2\u521b\u5efa\u72ec\u7acb Perforce pending changelist\uff0c\u8bb0\u5f55\u7528\u6237\u56de\u5408\u3001\u6587\u4ef6\u52a8\u4f5c\u3001\u524d\u540e\u54c8\u5e0c\u548c\u6587\u672c\u8865\u4e01\uff1b\u540c\u65f6\u4ee5\u76ee\u6807 CL \u7684 P4 #have \u4e3a Git \u57fa\u7ebf\uff0c\u628a\u5916\u7f6e Git \u5143\u6570\u636e\u8fde\u63a5\u5230\u771f\u5b9e\u5de5\u4f5c\u533a\uff0c\u4f7f Codex \u539f\u751f Review \u663e\u793a\u5dee\u5f02\u3002\u8de8\u4f1a\u8bdd\u547d\u4e2d\u540c\u4e00\u5df2\u6253\u5f00\u6587\u4ef6\u65f6\u9ed8\u8ba4\u62d2\u7edd\uff0c\u4e0d\u81ea\u52a8\u63d0\u4ea4\u3001shelve\u3001revert \u6216\u541e\u5e76\u5176\u4ed6 CL\u3002",
     "developerName": "BillyCSZhao",
     "category": "Productivity",
     "capabilities": [
@@ -34,9 +37,9 @@
     "composerIcon": "./assets/icon.png",
     "logo": "./assets/logo.png",
     "defaultPrompt": [
-      "检查当前 P4 环境并启用 Codex 原生 Review。",
-      "刷新当前 P4 变更列表的原生 Review。",
-      "用 P4V diffhave 打开当前文本差异。"
+      "\u68c0\u67e5\u5f53\u524d Codex \u4f1a\u8bdd\u7684 P4 changelist \u548c\u56de\u5408\u5ba1\u8ba1\u8bb0\u5f55\u3002",
+      "\u7528\u5f53\u524d\u4f1a\u8bdd CL \u5237\u65b0 Codex \u539f\u751f Review\u3002",
+      "\u7528 P4V diffhave \u6253\u5f00\u5f53\u524d\u6587\u672c\u5dee\u5f02\u3002"
     ]
   }
 }
