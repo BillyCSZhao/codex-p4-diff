@@ -1,5 +1,7 @@
 # Codex P4 Diff
 
+[简体中文](README.zh-CN.md) | Current release: [v0.5.1](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.1)
+
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
 - the P4 project root becomes one local Git repository on `codex/local-history`;
@@ -10,6 +12,10 @@ Codex P4 Diff records Codex changes as local Git history without modifying Perfo
 
 The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
+## What's new in v0.5.1
+
+The Windows PowerShell 5.1 Hook launcher now preserves UTF-8 input end to end. Chinese request summaries therefore remain readable in commit messages and audit notes instead of being replaced with `?`. Storage, commit, and Perforce behavior are otherwise unchanged from v0.5.0.
+
 ## Install
 
 Prerequisites: Codex with plugin and Hook support, Python 3.10+, `p4` with a working login/client mapping, and Git 2.x.
@@ -17,7 +23,10 @@ Prerequisites: Codex with plugin and Hook support, Python 3.10+, `p4` with a wor
 ```powershell
 codex plugin marketplace add BillyCSZhao/codex-p4-diff
 codex plugin add codex-p4-diff@billycszhao-plugins
+codex plugin list --json
 ```
+
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.1`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
@@ -53,10 +62,17 @@ This Git repository uses the real P4 working tree. GitHub Desktop or Git command
 
 ## Doctor and migration
 
+Run `codex plugin list --json` first. Set `$PluginRoot` to the installed `codex-p4-diff@billycszhao-plugins` item's `source.path`, then run:
+
 ```powershell
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\scripts\run_codex_p4_diff.ps1" `
-  --workspace "C:\path\to\p4-project" `
-  --project-root "C:\path\to\p4-project" `
+$ProjectRoot = (Get-Location).Path
+$PluginRoot = 'C:\path\shown-by-codex-plugin-list'
+$SkillRoot = Join-Path $PluginRoot 'skills\codex-p4-diff'
+$Runner = Join-Path $SkillRoot 'scripts\run_codex_p4_diff.ps1'
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Runner `
+  --workspace $ProjectRoot `
+  --project-root $ProjectRoot `
   --doctor
 ```
 
@@ -72,7 +88,15 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Restart Codex, approve the updated Hooks, and create a new task.
+Confirm that the installed version is `0.5.1`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+
+```powershell
+codex plugin remove codex-p4-diff@billycszhao-plugins
+codex plugin add codex-p4-diff@billycszhao-plugins
+codex plugin list --json
+```
+
+Restart Codex, approve the updated Hooks, and create a new task. Do not remove a separate local-development plugin from another marketplace.
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
