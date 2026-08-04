@@ -1,6 +1,6 @@
 {
   "name": "codex-p4-diff",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "\u5728 P4 \u5de5\u7a0b\u6839\u5efa\u7acb\u5355\u4e00\u672c\u5730 Git \u5386\u53f2\u5206\u652f\uff0c\u5e76\u5728\u6bcf\u4e2a\u6709\u6539\u52a8\u7684 Codex \u7528\u6237\u56de\u5408\u7ed3\u675f\u65f6\u81ea\u52a8 commit\uff1bP4 \u59cb\u7ec8\u53ea\u8bfb\u3002",
   "author": {
     "name": "BillyCSZhao",

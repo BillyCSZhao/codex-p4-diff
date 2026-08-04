@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 - 2026-08-04
 
 - Preserve UTF-8 hook input across the Windows PowerShell 5.1 launcher so Chinese prompt summaries remain intact in commit messages and audit notes.
 
