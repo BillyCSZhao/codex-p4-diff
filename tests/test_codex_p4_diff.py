@@ -43,9 +43,10 @@ class ExecutableResolutionTests(unittest.TestCase):
 
 
 class PlatformPathTests(unittest.TestCase):
-    def test_local_app_data_is_preferred(self) -> None:
+    def test_platform_state_directory_is_preferred(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            with mock.patch.dict(MODULE.os.environ, {"LOCALAPPDATA": temp}, clear=False):
+            variable = "LOCALAPPDATA" if MODULE.os.name == "nt" else "XDG_STATE_HOME"
+            with mock.patch.dict(MODULE.os.environ, {variable: temp}, clear=False):
                 self.assertEqual(MODULE.user_data_root(), Path(temp))
 
     def test_p4_filespec_characters_are_escaped(self) -> None:
