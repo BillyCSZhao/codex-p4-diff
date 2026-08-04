@@ -18,9 +18,8 @@ import xml.etree.ElementTree as ET
 
 
 TOOL_NAME = "codex-p4-diff"
-SCHEMA_VERSION = 4
-BASE_BRANCH = "codex/base"
-SESSION_BRANCH_PREFIX = "codex/session/"
+SCHEMA_VERSION = 5
+HISTORY_BRANCH = "codex/local-history"
 READ_ONLY_P4_COMMANDS = frozenset({"info", "where", "fstat", "diff", "opened", "print"})
 
 
@@ -387,7 +386,7 @@ def storage_paths(context: dict[str, Any], project_root: Path) -> dict[str, Path
     key = project_key(context, project_root)
     return {
         "root": root,
-        "history": root / "History" / key,
+        "history": project_root.resolve(),
         "state": root / "State" / key,
     }
 
@@ -395,6 +394,32 @@ def storage_paths(context: dict[str, Any], project_root: Path) -> dict[str, Path
 def git_output(git_exe: str, repo: Path, args: Iterable[str], *, check: bool = True) -> str:
     completed = run_command([git_exe, "-C", str(repo), *args], check=check)
     return completed.stdout.decode("utf-8", errors="replace").strip()
+
+
+def git_metadata_dir(git_exe: str, project_root: Path) -> Path:
+    value = git_output(git_exe, project_root, ["rev-parse", "--absolute-git-dir"])
+    return Path(value).resolve()
+
+
+def install_info_exclude(git_dir: Path) -> None:
+    exclude = git_dir / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    begin = "# BEGIN codex-p4-diff managed untracked-file policy"
+    end = "# END codex-p4-diff managed untracked-file policy"
+    block = f"{begin}\n*\n{end}\n"
+    current = exclude.read_text(encoding="utf-8", errors="replace") if exclude.is_file() else ""
+    if begin in current and end in current:
+        prefix, remainder = current.split(begin, 1)
+        _old, suffix = remainder.split(end, 1)
+        updated = prefix.rstrip("\n") + ("\n" if prefix.strip() else "") + block + suffix.lstrip("\n")
+    else:
+        updated = current.rstrip("\n") + ("\n" if current.strip() else "") + block
+    if current != updated:
+        exclude.write_text(updated, encoding="utf-8", newline="\n")
+
+
+def owned_repo_marker(git_dir: Path) -> Path:
+    return git_dir / TOOL_NAME / "project.json"
 
 
 def ensure_history_repo(
@@ -405,36 +430,65 @@ def ensure_history_repo(
 ) -> dict[str, Any]:
     executable = resolve_executable(git_exe, "git", "请安装 Git 2.x。")
     paths = storage_paths(context, project_root)
-    history_root = paths["history"]
+    history_root = project_root.resolve()
     state_root = paths["state"]
     state_root.mkdir(parents=True, exist_ok=True)
 
-    if not (history_root / ".git").exists():
-        if history_root.exists() and any(history_root.iterdir()):
-            raise CodexP4DiffError(f"历史目录非空且不是本工具的 Git 仓库：{history_root}")
-        history_root.mkdir(parents=True, exist_ok=True)
-        init = run_command([executable, "init", "-b", BASE_BRANCH, str(history_root)], check=False)
+    pointer = history_root / ".git"
+    if pointer.is_file():
+        migration = detach_legacy_git_pointer(history_root)
+        if not migration.get("removed"):
+            raise CodexP4DiffError(
+                f"项目已有非本工具拥有的 .git 指针，拒绝接管：{pointer}"
+            )
+
+    if not pointer.exists():
+        enclosing = git_output(
+            executable,
+            history_root,
+            ["rev-parse", "--show-toplevel"],
+            check=False,
+        )
+        if enclosing:
+            raise CodexP4DiffError(
+                f"项目位于现有 Git 仓库 {Path(enclosing).resolve()} 内，拒绝创建嵌套历史仓库。"
+            )
+        init = run_command([executable, "init", "-b", HISTORY_BRANCH, str(history_root)], check=False)
         if init.returncode != 0:
             run_command([executable, "init", str(history_root)])
-            run_command([executable, "-C", str(history_root), "checkout", "-b", BASE_BRANCH])
+            git_output(
+                executable,
+                history_root,
+                ["symbolic-ref", "HEAD", f"refs/heads/{HISTORY_BRANCH}"],
+            )
         git_output(executable, history_root, ["config", "user.name", "Codex P4 Diff"])
         git_output(executable, history_root, ["config", "user.email", "codex-p4-diff@local.invalid"])
-        marker_dir = history_root / ".codex-p4-diff"
-        marker_dir.mkdir(parents=True, exist_ok=True)
+        git_dir = git_metadata_dir(executable, history_root)
+        marker_path = owned_repo_marker(git_dir)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker = {
             "schemaVersion": SCHEMA_VERSION,
             "generatedBy": TOOL_NAME,
             "projectRoot": str(project_root.resolve()),
             "serverAddress": context.get("serverAddress"),
             "client": context.get("client"),
-            "createdFor": "local turn history; never push",
+            "branch": HISTORY_BRANCH,
+            "createdFor": "project-local Codex turn history; never push",
         }
-        (marker_dir / "project.json").write_text(
+        marker_path.write_text(
             json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        git_output(executable, history_root, ["add", ".codex-p4-diff/project.json"])
+        install_info_exclude(git_dir)
         run_command(
-            [executable, "-C", str(history_root), "commit", "-m", "Initialize Codex local history"],
+            [
+                executable,
+                "-C",
+                str(history_root),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initialize Codex local history",
+            ],
             env={
                 **os.environ,
                 "GIT_AUTHOR_NAME": "Codex P4 Diff",
@@ -443,28 +497,52 @@ def ensure_history_repo(
                 "GIT_COMMITTER_EMAIL": "codex-p4-diff@local.invalid",
             },
         )
+        marker["initialCommit"] = git_output(executable, history_root, ["rev-parse", "HEAD"])
+        marker_path.write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
 
-    marker_path = history_root / ".codex-p4-diff" / "project.json"
+    top_level = Path(
+        git_output(executable, history_root, ["rev-parse", "--show-toplevel"])
+    ).resolve()
+    if top_level != history_root:
+        raise CodexP4DiffError(
+            f"Git 顶层目录不是 P4 项目根，拒绝使用：{top_level}"
+        )
+    git_dir = git_metadata_dir(executable, history_root)
+    marker_path = owned_repo_marker(git_dir)
     try:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise CodexP4DiffError(f"历史仓库缺少有效的所有权标记：{marker_path}") from exc
+        raise CodexP4DiffError(
+            f"项目已有 Git 仓库但缺少 {TOOL_NAME} 所有权标记，拒绝接管：{marker_path}"
+        ) from exc
     if marker.get("generatedBy") != TOOL_NAME:
-        raise CodexP4DiffError(f"历史仓库不属于 {TOOL_NAME}：{history_root}")
+        raise CodexP4DiffError(f"项目 Git 仓库不属于 {TOOL_NAME}：{history_root}")
     if Path(str(marker.get("projectRoot") or "")).resolve() != project_root.resolve():
-        raise CodexP4DiffError(f"历史仓库属于另一个项目：{history_root}")
+        raise CodexP4DiffError(f"项目 Git 仓库属于另一个项目：{history_root}")
+
+    branch = git_output(executable, history_root, ["symbolic-ref", "--short", "HEAD"], check=False)
+    if branch != HISTORY_BRANCH:
+        raise CodexP4DiffError(
+            f"本地历史必须停留在固定分支 {HISTORY_BRANCH}，当前为 {branch or '<detached>'}；"
+            "插件不会自动切换分支。"
+        )
 
     remotes = git_output(executable, history_root, ["remote"], check=False).splitlines()
     if remotes:
         raise CodexP4DiffError(
             f"本地历史仓库不允许配置 Git remote，请先移除：{', '.join(remotes)}"
         )
+    install_info_exclude(git_dir)
     install_pre_push_hook_with_exe(executable, history_root)
     return {
         "gitExe": executable,
         "historyRoot": history_root,
         "stateRoot": state_root,
-        "baseCommit": git_output(executable, history_root, ["rev-parse", BASE_BRANCH]),
+        "branch": HISTORY_BRANCH,
+        "baseCommit": str(marker.get("initialCommit") or ""),
+        "headCommit": git_output(executable, history_root, ["rev-parse", "HEAD"]),
     }
 
 
@@ -574,13 +652,14 @@ def doctor_report(
         else:
             paths = storage_paths(context, project_root)
             report["historyRoot"] = str(paths["history"])
-        report["checks"].append({"name": "local-git-history", "ok": True})
+        report["branch"] = HISTORY_BRANCH
+        report["checks"].append({"name": "project-local-git-history", "ok": True})
         pointer = project_root.resolve() / ".git"
         report["legacyGitPointer"] = str(pointer) if pointer.is_file() else None
         report["checks"].append(
             {
-                "name": "workspace-detached-from-history",
-                "ok": not pointer.is_file(),
+                "name": "project-git-root",
+                "ok": pointer.is_dir(),
                 "hint": "运行 --detach-legacy-review 移除旧版工具拥有的 .git 指针。"
                 if pointer.is_file()
                 else None,

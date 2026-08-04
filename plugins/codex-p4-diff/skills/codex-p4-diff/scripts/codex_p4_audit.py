@@ -55,7 +55,6 @@ class AuditContext:
     state_root: Path
     session_root: Path
     git_exe: str
-    base_commit: str
 
 
 def utc_now() -> str:
@@ -168,19 +167,17 @@ def resolve_context(event: dict[str, Any]) -> AuditContext:
     paths = bridge.storage_paths(p4_context, project_root)
     paths["state"].mkdir(parents=True, exist_ok=True)
     with project_lock(paths["state"]):
-        bridge.detach_legacy_git_pointer(project_root)
         history = bridge.ensure_history_repo(p4_context, project_root)
     session_key = bridge.sanitize_component(session_id, 80)
     return AuditContext(
         p4=p4_context,
         project_root=project_root,
         session_id=session_id,
-        branch=f"{bridge.SESSION_BRANCH_PREFIX}{session_key}",
+        branch=bridge.HISTORY_BRANCH,
         history_root=Path(history["historyRoot"]),
         state_root=Path(history["stateRoot"]),
         session_root=Path(history["stateRoot"]) / "sessions" / session_key,
         git_exe=str(history["gitExe"]),
-        base_commit=str(history["baseCommit"]),
     )
 
 
@@ -507,17 +504,18 @@ def release_paths(ctx: AuditContext) -> None:
     atomic_write_json(ownership_path(ctx), registry)
 
 
-def ensure_session_branch(ctx: AuditContext) -> str:
-    ref = f"refs/heads/{ctx.branch}"
-    completed = bridge.run_command(
-        [ctx.git_exe, "-C", str(ctx.history_root), "rev-parse", "--verify", ref], check=False
+def current_history_head(ctx: AuditContext) -> str:
+    branch = bridge.git_output(
+        ctx.git_exe,
+        ctx.history_root,
+        ["symbolic-ref", "--short", "HEAD"],
+        check=False,
     )
-    if completed.returncode == 0:
-        return completed.stdout.decode("ascii", errors="replace").strip()
-    bridge.run_command(
-        [ctx.git_exe, "-C", str(ctx.history_root), "update-ref", ref, ctx.base_commit]
-    )
-    return ctx.base_commit
+    if branch != ctx.branch:
+        raise AuditError(
+            f"本地历史分支被切换为 {branch or '<detached>'}；请切回 {ctx.branch} 后重试。"
+        )
+    return bridge.git_output(ctx.git_exe, ctx.history_root, ["rev-parse", "HEAD"])
 
 
 def git_blob_at(ctx: AuditContext, commit: str, path: str) -> bytes | None:
@@ -578,7 +576,7 @@ def commit_tree(
     parent: str,
     updates: dict[str, bytes | None],
     message: str,
-) -> str:
+) -> tuple[str, dict[str, str | None]]:
     ctx.session_root.mkdir(parents=True, exist_ok=True)
     handle, index_name = tempfile.mkstemp(prefix="git-index-", dir=str(ctx.session_root))
     os.close(handle)
@@ -595,6 +593,7 @@ def commit_tree(
         bridge.run_command(
             [ctx.git_exe, "-C", str(ctx.history_root), "read-tree", parent], env=env
         )
+        index_entries: dict[str, str | None] = {}
         for path, data in sorted(updates.items()):
             if data is None:
                 bridge.run_command(
@@ -610,6 +609,7 @@ def commit_tree(
                     env=env,
                     check=False,
                 )
+                index_entries[path] = None
                 continue
             blob = bridge.run_command(
                 [ctx.git_exe, "-C", str(ctx.history_root), "hash-object", "-w", "--stdin"],
@@ -629,6 +629,7 @@ def commit_tree(
                 ],
                 env=env,
             )
+            index_entries[path] = blob
         tree = bridge.run_command(
             [ctx.git_exe, "-C", str(ctx.history_root), "write-tree"], env=env
         ).stdout.decode("ascii").strip()
@@ -637,16 +638,102 @@ def commit_tree(
             input_bytes=message.encode("utf-8"),
             env=env,
         ).stdout.decode("ascii").strip()
-        ref = f"refs/heads/{ctx.branch}"
-        bridge.run_command(
-            [ctx.git_exe, "-C", str(ctx.history_root), "update-ref", ref, commit, parent]
-        )
-        return commit
+        return commit, index_entries
     finally:
         try:
             os.unlink(index_name)
         except FileNotFoundError:
             pass
+
+
+def ensure_turn_paths_not_staged(ctx: AuditContext, parent: str, paths: list[str]) -> None:
+    completed = bridge.run_command(
+        [
+            ctx.git_exe,
+            "-C",
+            str(ctx.history_root),
+            "diff",
+            "--cached",
+            "--quiet",
+            parent,
+            "--",
+            *paths,
+        ],
+        check=False,
+    )
+    if completed.returncode == 1:
+        raise AuditError(
+            "本回合目标路径包含用户或其他工具已暂存的 Git 改动；"
+            "为避免覆盖暂存状态，本地回合 commit 已停止。"
+        )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise AuditError(f"无法核对本回合 Git 暂存状态：{message}")
+
+
+def sync_main_index(ctx: AuditContext, entries: dict[str, str | None]) -> None:
+    for path, blob in sorted(entries.items()):
+        if blob is None:
+            bridge.run_command(
+                [
+                    ctx.git_exe,
+                    "-C",
+                    str(ctx.history_root),
+                    "update-index",
+                    "--force-remove",
+                    "--",
+                    path,
+                ],
+                check=False,
+            )
+            continue
+        bridge.run_command(
+            [
+                ctx.git_exe,
+                "-C",
+                str(ctx.history_root),
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                blob,
+                path,
+            ]
+        )
+
+
+def attach_audit_note(ctx: AuditContext, commit: str, record: dict[str, Any]) -> None:
+    payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    bridge.run_command(
+        [
+            ctx.git_exe,
+            "-C",
+            str(ctx.history_root),
+            "notes",
+            "--ref=codex-p4-diff",
+            "add",
+            "-f",
+            "-F",
+            "-",
+            commit,
+        ],
+        input_bytes=payload,
+    )
+
+
+def entries_at_commit(ctx: AuditContext, commit: str, paths: Iterable[str]) -> dict[str, str | None]:
+    entries: dict[str, str | None] = {}
+    for path in paths:
+        completed = bridge.run_command(
+            [ctx.git_exe, "-C", str(ctx.history_root), "rev-parse", f"{commit}:{path}"],
+            check=False,
+        )
+        entries[path] = (
+            completed.stdout.decode("ascii", errors="replace").strip()
+            if completed.returncode == 0
+            else None
+        )
+    return entries
 
 
 def create_turn_commit(
@@ -657,44 +744,43 @@ def create_turn_commit(
     changes: list[dict[str, Any]],
     patches: list[str],
 ) -> tuple[str, str]:
-    parent = ensure_session_branch(ctx)
+    parent = current_history_head(ctx)
     sequence = int(session.get("nextSequence") or 1)
-    turn_key = bridge.sanitize_component(turn_id, 64)
-    commit_root = f"turns/{sequence:04d}-{turn_key}"
     updates: dict[str, bytes | None] = {}
+    turn_paths = sorted(str(change["path"]) for change in changes)
+    ensure_turn_paths_not_staged(ctx, parent, turn_paths)
 
     for change in changes:
         relative = str(change["path"])
-        mirror_path = f"files/{relative}"
         before = change["before"]
         after = change["after"]
         before_data = change.pop("_beforeData", None)
         after_data = change.pop("_afterData", None)
-        parent_data = git_blob_at(ctx, parent, mirror_path)
-        mirror_state = "receipt-only"
+        parent_data = git_blob_at(ctx, parent, relative)
+        history_state = "receipt-only"
         if after.get("captured") and after_data is not None:
             if parent_data is None:
-                updates[mirror_path] = after_data
-                mirror_state = "first-touch"
+                updates[relative] = after_data
+                history_state = "first-touch"
             elif before.get("captured") and before_data is not None and parent_data == before_data:
-                updates[mirror_path] = after_data
-                mirror_state = "exact"
+                updates[relative] = after_data
+                history_state = "exact"
             else:
-                mirror_state = "drifted-receipt-only"
+                history_state = "drifted-receipt-only"
         elif not after.get("exists"):
             if parent_data is not None and before.get("captured") and parent_data == before_data:
-                updates[mirror_path] = None
-                mirror_state = "exact-delete"
+                updates[relative] = None
+                history_state = "exact-delete"
             else:
-                mirror_state = "delete-receipt-only"
-        change["mirrorState"] = mirror_state
+                history_state = "delete-receipt-only"
+        change["historyState"] = history_state
 
     event_record = {
         "schemaVersion": bridge.SCHEMA_VERSION,
         "generatedBy": bridge.TOOL_NAME,
         "sessionId": ctx.session_id,
         "turnId": turn_id,
-        "sequence": sequence,
+        "sessionSequence": sequence,
         "branch": ctx.branch,
         "projectRoot": str(ctx.project_root),
         "promptSummary": prompt.get("summary"),
@@ -702,12 +788,8 @@ def create_turn_commit(
         "recordedAt": utc_now(),
         "p4Mode": "read-only",
         "files": changes,
+        "textPatch": "\n".join(patches) if patches else None,
     }
-    updates[f"{commit_root}/event.json"] = (
-        json.dumps(event_record, ensure_ascii=False, indent=2) + "\n"
-    ).encode("utf-8")
-    if patches:
-        updates[f"{commit_root}/changes.patch"] = "\n".join(patches).encode("utf-8")
 
     summary = str(prompt.get("summary") or "Codex file changes")
     subject = f"[Codex] {summary}"[:120]
@@ -716,14 +798,44 @@ def create_turn_commit(
         "",
         f"Session: {ctx.session_id}",
         f"Turn: {turn_id}",
+        f"Recorded-At: {event_record['recordedAt']}",
+        f"Prompt-Recorded-At: {prompt.get('recordedAt') or '-'}",
         f"Project: {ctx.project_root}",
         "P4 mode: read-only",
         "Files:",
     ]
-    body.extend(f"- {item['action']} {item['path']}" for item in changes)
-    body.extend(["", f"Audit: {commit_root}/event.json", ""])
-    commit = commit_tree(ctx, parent, updates, "\n".join(body))
-    return commit, f"{commit_root}/event.json"
+    for item in changes:
+        before = item["before"]
+        after = item["after"]
+        p4 = item.get("p4") or {}
+        body.append(
+            f"- {item['action']} {item['path']} "
+            f"before={before.get('sha256') or '-'}:{before.get('size')} "
+            f"after={after.get('sha256') or '-'}:{after.get('size')} "
+            f"history={item['historyState']} "
+            f"p4={p4.get('depotFile') or '-'}@{p4.get('haveRev') or '-'}/{p4.get('headRev') or '-'}"
+        )
+    body.extend(["", "Audit-Notes-Ref: refs/notes/codex-p4-diff", ""])
+    commit, entries = commit_tree(ctx, parent, updates, "\n".join(body))
+    attach_audit_note(ctx, commit, event_record)
+    parent_entries = entries_at_commit(ctx, parent, entries)
+    try:
+        sync_main_index(ctx, entries)
+        bridge.run_command(
+            [
+                ctx.git_exe,
+                "-C",
+                str(ctx.history_root),
+                "update-ref",
+                f"refs/heads/{ctx.branch}",
+                commit,
+                parent,
+            ]
+        )
+    except (bridge.CodexP4DiffError, OSError):
+        sync_main_index(ctx, parent_entries)
+        raise
+    return commit, "refs/notes/codex-p4-diff"
 
 
 def record_prompt(ctx: AuditContext, event: dict[str, Any]) -> str:
@@ -872,7 +984,7 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
             {
                 "status": "committed",
                 "commit": commit,
-                "auditPath": audit_path,
+                "auditNotesRef": audit_path,
                 "fileCount": len(changes),
                 "summary": prompt.get("summary"),
                 "finishedAt": utc_now(),

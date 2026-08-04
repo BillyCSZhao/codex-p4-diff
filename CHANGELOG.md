@@ -1,26 +1,27 @@
 # Changelog
 
+## 0.5.0 - 2026-08-04
+
+- Initialize a real local Git repository directly at each P4 project root.
+- Use one fixed `codex/local-history` branch for every Codex session, with no per-session switching.
+- Create one local commit per changed user turn using real project-relative paths for Codex Review and GitHub Desktop.
+- Put session, turn, request, file action, hash, size, P4 metadata, and exact text patch details in commit messages and `refs/notes/codex-p4-diff`.
+- Serialize cross-session commits and retain same-path ownership protection.
+- Update only the recorded turn paths in Git's index, refuse same-path staged conflicts, and preserve unrelated staged content.
+- Refuse to take over foreign Git repositories, reject remotes, and block push.
+- Keep the runtime P4 whitelist read-only and leave all P4 changelists untouched.
+
 ## 0.4.0 - 2026-08-03
 
 - Replace Perforce changelist creation and reconciliation with one external local Git branch per Codex session.
-- Create one automatic local Git commit per changed user turn, including a redacted request summary, file actions, hashes, sizes, read-only P4 metadata, and unified text patches.
+- Create one automatic local Git commit per changed user turn with local audit receipts.
 - Enforce a runtime read-only P4 command whitelist and remove every P4 mutation path.
-- Store history outside the P4 workspace so GitHub Desktop operations cannot modify real P4 files.
-- Keep history local-only with no remote and a `pre-push` blocker; remove the old `pre-commit` blocker so automatic turn commits can succeed.
-- Add local cross-session path ownership without using P4 changelist ownership.
-- Add an 8 MiB default blob threshold and receipt-only large-file history for Unreal assets.
-- Migrate safely from 0.3 by detaching only legacy tool-owned `.git` pointers while leaving old P4 changelists untouched.
+- Add local cross-session path ownership and an 8 MiB default blob threshold.
 
 ## 0.3.0 - 2026-08-03
 
-- Create one Perforce pending changelist per writing Codex task, with lazy creation on the first managed write.
-- Record one local audit event per user turn, including file actions, hashes, sizes, and unified text patches.
-- Add Codex lifecycle Hooks for session validation, pre-write ownership checks, post-write reconciliation, and turn finalization.
-- Reject writes to files already owned by another changelist instead of silently moving them with `p4 reopen`.
-- Add `--changelist auto` resolution with session, client, project, and changelist ownership validation.
-- Add session and audit summaries to pending changelist descriptions without uploading full prompts.
-- Preserve the external Git baseline and native Codex Review workflow from 0.2.0.
-- Document the required marketplace refresh, plugin reinstall, Codex restart, and new-task update flow.
+- Create one Perforce pending changelist per writing Codex task and one local audit event per user turn.
+- Add lifecycle Hooks for ownership, reconciliation, and turn finalization.
 
 ## 0.2.0 - 2026-07-22
 

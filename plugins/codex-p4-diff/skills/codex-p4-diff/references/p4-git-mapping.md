@@ -3,95 +3,88 @@
 ## 存储拓扑
 
 ~~~text
-<P4 ProjectRoot>/                    # 真实工作区，不放置 Git 元数据
+<P4 ProjectRoot>/
+└─ .git/
+   ├─ codex-p4-diff/project.json    # 插件所有权、项目和初始 commit
+   ├─ info/exclude                  # 默认忽略全部未追踪文件；回合路径显式加入
+   ├─ hooks/pre-push                # 阻止发布本地审计历史
+   └─ refs/notes/codex-p4-diff      # 每条 commit 的完整回合收据
 
-%LOCALAPPDATA%/CodexP4Diff/
-├─ History/<project-name-hash>/      # 可添加到 GitHub Desktop 的本地 Git 仓库
-│  ├─ .git/
-│  ├─ .codex-p4-diff/project.json
-│  ├─ files/<project-relative-path>  # 小文件的滚动镜像
-│  └─ turns/<sequence-turn-id>/
-│     ├─ event.json                  # 摘要、动作、哈希、大小、P4 只读元数据
-│     └─ changes.patch               # 精确的本回合文本补丁
-└─ State/<project-name-hash>/
-   ├─ ownership.json                 # 跨会话本地路径所有权
-   └─ sessions/<session-id>/
-      ├─ session.json
-      └─ turns/<turn-id>/            # commit 前的临时快照和重试状态
+%LOCALAPPDATA%/CodexP4Diff/State/<project-name-hash>/
+├─ ownership.json                   # 跨会话同路径所有权
+└─ sessions/<session-id>/
+   ├─ session.json
+   └─ turns/<turn-id>/              # commit 前快照和重试状态
 ~~~
 
-项目键由 P4 server、client 和项目绝对路径共同生成。历史仓库与真实工作区没有 `.git` 连接，因此 GitHub Desktop 的分支切换或丢弃操作不会修改 P4 文件。
+项目键由 P4 server、client 和项目绝对路径生成，只用于外置 State。0.4 的 `%LOCALAPPDATA%/CodexP4Diff/History` 不迁移、不删除，仍可作为旧记录查看。
 
 ## Commit 拓扑
 
-`codex/base` 只包含一次初始化记录。每个会话分支从它开始：
+所有会话按回合完成时间推进固定分支：
 
 ~~~text
-codex/base
-  └─ [Codex] turn 1
-       └─ [Codex] turn 2
-            └─ [Codex] turn 3
+codex/local-history
+  Initialize Codex local history
+    └─ [Codex] session A / turn 1
+         └─ [Codex] session B / turn 1
+              └─ [Codex] session A / turn 2
 ~~~
 
-每个有变化的回合只创建一个 `[Codex]` commit。无变化回合写入本地会话状态但不创建空 commit。
+project lock 序列化读取 HEAD、生成 commit、更新 notes/index/ref 的流程。commit message 和 note 都包含 session/turn，因此无需分支隔离也能追溯归属。
 
-首次接触一个已有文件时，`files/...` 在 Git 中表现为新增完整文件，因为分支父提交尚无该文件；同一 commit 的 `turns/.../changes.patch` 始终保存精确的写入前后文本差异。后续回合在镜像状态与写入前状态一致时显示普通 Git 文件 Diff。若文件在回合之间被外部修改，插件不把外部变化冒充 Codex 修改，而把镜像标记为 `drifted-receipt-only`，以补丁和哈希作为审计依据。
+## 精确路径与漂移
 
-## 大文件和二进制
+- 小文件直接以真实工程相对路径进入 commit，Codex Review 和 GitHub Desktop 显示真实文件 Diff。
+- 首次接触已有 P4 文件时，Git 父提交没有该路径，因此 commit Diff 显示完整新增；note 中的 `textPatch` 保存精确写入前后差异。
+- 若 Git HEAD 内容与 Hook 捕获的写入前内容不一致，标记 `drifted-receipt-only`，不把外部变化冒充 Codex 修改。
+- 删除仅在 Git HEAD 与捕获前内容一致时进入 commit，否则用 `delete-receipt-only` 记录。
+- 超过 8 MiB 的文件默认只记录收据，不写入 Git blob。
 
-- 默认阈值为 8 MiB。
-- 阈值以内的文件可写入 `files/...` 镜像；GitHub Desktop 对二进制显示 binary changed。
-- 超过阈值的文件只在 `event.json` 保存前后 SHA-256、大小和 P4 元数据，不把完整资产写入 Git 对象库。
-- 设置 `CODEX_P4_DIFF_MAX_BLOB_BYTES` 可调整阈值。降低阈值可以限制 Unreal 资产历史增长。
+## Git index 边界
+
+插件使用临时 index 构造 commit，从不运行 `git add -A`。提交前检查本回合目标路径：若已有 staged 变化则停止，避免覆盖用户或其他工具的暂存状态。不相关路径的 staged 内容保留且不会进入 Codex commit。commit 成功后只把本回合实际提交路径同步到主 index，使工作树保持干净并保留其他 staged 状态。
 
 ## P4 只读保证
 
-运行时代码用白名单拒绝非只读 P4 命令。允许集合固定为：
+允许集合固定为 `info`、`where`、`fstat`、`diff`、`opened`、`print`。插件不创建或更新 P4 changelist，不 checkout、reconcile、reopen、revert、shelve 或 submit。旧 pending CL 由用户在 P4V 中处理。
 
-~~~text
-p4 info
-p4 where
-p4 fstat
-p4 diff
-p4 opened
-p4 print
+## 查看历史
+
+在 Codex Review 选择 `Last turn` 或最新 `Commit`。在 GitHub Desktop 添加项目根，保持 `codex/local-history`，从 History 选择 commit。完整收据运行：
+
+~~~powershell
+git notes --ref=codex-p4-diff show <commit>
 ~~~
 
-插件不创建或更新 P4 changelist，不 checkout 文件，不 reconcile，不 reopen，不 revert，不 shelve，也不 submit。旧版插件创建的 pending CL 不会自动迁移或删除；由用户继续在 P4V 中处理。
+不要 Publish。因为 `.git` 直接绑定真实 P4 工作树，Git checkout、switch、discard、restore、reset、clean、merge 和 rebase 会修改项目文件。
 
-## GitHub Desktop
+## 迁移
 
-1. 运行 `--history-path` 获取目录。
-2. 在 GitHub Desktop 选择 **File > Add Local Repository** 并选择该目录。
-3. 从 **Current Branch** 选择 `codex/session/<session-id>`。
-4. 从 History 查看 `[Codex]` commit；打开 `event.json` 查看详情，打开 `changes.patch` 查看首触或漂移文件的精确差异。
-
-历史仓库没有 remote。不要使用 Publish repository；`pre-push` 也会拒绝 push。
-
-## 迁移旧版 0.3
-
-0.3 可能在项目根创建 `.git` 指针并把文件放入 P4 pending CL。0.4 的 `SessionStart` 会删除且只删除指向 `%LOCALAPPDATA%\CodexP4Diff\Native`、`Sidecars` 或旧 `Audit` 目录的 `.git` 文件，不删除目标目录，也不修改 P4 文件或 CL。
-
-若自动迁移没有运行，执行 `--detach-legacy-review`。真实 `.git` 目录、未知 `.git` 文件和外部 Git 指针都保持不变并报告原因。
+0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。
 
 ## 常见问题
 
 ### doctor 显示 `ready=false`
 
-按 `checks[].hint` 修复。常见原因是 P4 登录失效、项目未映射、Git 缺失、历史仓库被添加 remote，或仍存在旧版 `.git` 指针。
+常见原因是 P4 登录失效、项目未映射、Git 缺失、项目已有外来仓库、配置了 remote 或当前不在 `codex/local-history`。插件不会自动切换分支。
 
 ### 回合结束没有 commit
 
-先确认本回合确实改变了 Hook 在写入前识别到的文件。无文件变化不会创建空 commit。插件升级后必须重启 Codex、信任新版 Hooks 并新建任务；旧任务不会热加载 Hook。
+无文件变化不会创建空 commit。确认 Hook 在写入前识别了目标路径；升级后需重启 Codex、信任新版 Hooks并新建任务。
 
-### shell 命令修改了文件但没有精确补丁
+### Review 的 Unstaged 为空
 
-优先让 Codex 使用 `apply_patch`、`Edit`、`Write`，或在 shell 命令中传入明确文件路径。通用 Hook 无法可靠推断不透明脚本在运行后内部选择的所有路径；执行后才发现的路径只记录收据，不能伪造写入前快照。
+Stop hook 已把本回合改动提交后，`Unstaged` 为空是正常的。切换到 `Last turn` 或最新 `Commit`。
+
+### shell 修改没有精确补丁
+
+优先使用 `apply_patch`、`Edit`、`Write`，或传入明确文件路径。执行后才发现的路径只记录收据，不能伪造写入前快照。
 
 ### 同一路径被另一个会话锁定
 
-结束原 Codex 会话以触发 `SessionEnd`。异常退出留下的所有权记录在 24 小时后视为过期。不要通过 P4 reopen 解决，因为冲突记录完全是本地 Codex 会话状态。
+结束原任务以触发 `SessionEnd`。异常退出的所有权记录 24 小时后过期。不要通过 P4 reopen 解决。
 
 ### commit 失败
 
-真实 P4 工作区修改保持不变。修复 `event.json` 中报告的 Git/权限/remote 问题后重试回合收尾。不要删除 `State/.../sessions`，其中包含重试所需的写入前快照。
+真实 P4 文件保持修改状态。修复 Git 分支、remote、staged 冲突或权限问题后重试 Stop；不要删除 State 会话目录，其中有重试所需快照。

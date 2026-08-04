@@ -1,5 +1,5 @@
 {
-  "description": "Create one local Git branch per Codex session and one commit per changed user turn without modifying Perforce.",
+  "description": "Create one project-local Git commit per changed Codex user turn on a fixed branch without modifying Perforce.",
   "hooks": {
     "SessionStart": [
       {

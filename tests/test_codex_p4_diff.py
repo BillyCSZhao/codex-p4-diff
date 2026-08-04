@@ -111,6 +111,14 @@ class HistoryRepositoryTests(unittest.TestCase):
             with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
                 history = MODULE.ensure_history_repo(self.context(project), project)
             history_root = Path(history["historyRoot"])
+            self.assertEqual(history_root, project)
+            branch = subprocess.run(
+                [history["gitExe"], "-C", str(history_root), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(branch, MODULE.HISTORY_BRANCH)
             remotes = subprocess.run(
                 [history["gitExe"], "-C", str(history_root), "remote"],
                 check=True,
@@ -128,6 +136,56 @@ class HistoryRepositoryTests(unittest.TestCase):
             self.assertTrue(pre_push.is_file())
             self.assertIn("push is blocked", pre_push.read_text(encoding="utf-8"))
             self.assertFalse((Path(git_dir) / "hooks" / "pre-commit").exists())
+            marker = Path(git_dir) / MODULE.TOOL_NAME / "project.json"
+            self.assertTrue(marker.is_file())
+            exclude = (Path(git_dir) / "info" / "exclude").read_text(encoding="utf-8")
+            self.assertIn("BEGIN codex-p4-diff", exclude)
+            self.assertIn("\n*\n", exclude)
+            self.assertNotIn("!*/", exclude)
+
+    def test_history_repo_refuses_foreign_git_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            project = root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            subprocess.run(["git", "init", str(project)], check=True, capture_output=True)
+            with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
+                with self.assertRaisesRegex(MODULE.CodexP4DiffError, "拒绝接管"):
+                    MODULE.ensure_history_repo(self.context(project), project)
+
+    def test_history_repo_refuses_enclosing_git_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            workspace = root / "workspace"
+            project = workspace / "Project"
+            project.mkdir(parents=True)
+            subprocess.run(["git", "init", str(workspace)], check=True, capture_output=True)
+            with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
+                with self.assertRaisesRegex(MODULE.CodexP4DiffError, "嵌套历史仓库"):
+                    MODULE.ensure_history_repo(self.context(project), project)
+            self.assertFalse((project / ".git").exists())
+
+    def test_history_repo_never_switches_changed_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            project = root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            with mock.patch.object(MODULE, "user_data_root", return_value=root / "local"):
+                history = MODULE.ensure_history_repo(self.context(project), project)
+                subprocess.run(
+                    [history["gitExe"], "-C", str(project), "switch", "-c", "user/other"],
+                    check=True,
+                    capture_output=True,
+                )
+                with self.assertRaisesRegex(MODULE.CodexP4DiffError, "不会自动切换"):
+                    MODULE.ensure_history_repo(self.context(project), project)
+            branch = subprocess.run(
+                [history["gitExe"], "-C", str(project), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(branch, "user/other")
 
     def test_history_repo_rejects_added_remote(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -208,7 +266,7 @@ class DistributionTests(unittest.TestCase):
         )
         entry = marketplace["plugins"][0]
         self.assertEqual(manifest["name"], "codex-p4-diff")
-        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertEqual(manifest["version"], "0.5.0")
         self.assertEqual(manifest["author"]["name"], "BillyCSZhao")
         self.assertEqual(manifest["repository"], "https://github.com/BillyCSZhao/codex-p4-diff")
         self.assertEqual(entry["name"], manifest["name"])

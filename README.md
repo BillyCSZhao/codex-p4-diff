@@ -2,21 +2,17 @@
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
-- one Codex session becomes one `codex/session/<session-id>` branch;
-- one changed user turn becomes one automatic local Git commit;
-- Perforce is queried only for workspace and baseline metadata;
-- the history repository stays outside the P4 workspace, has no remote, and blocks push.
+- the P4 project root becomes one local Git repository on `codex/local-history`;
+- every changed user turn from every Codex session becomes one automatic local commit;
+- commit messages identify the session, turn, redacted request, paths, hashes, and sizes;
+- immutable audit details are stored in `refs/notes/codex-p4-diff`;
+- Perforce is restricted to read-only queries.
 
-The commit message contains the redacted request summary, session ID, turn ID, and changed paths. Each commit also includes an immutable `event.json` with file actions, before/after SHA-256 values, sizes, and read-only P4 metadata. Text changes include a unified patch.
+The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
 ## Install
 
-Prerequisites:
-
-- Codex Desktop or CLI with plugin and Hook support;
-- Python 3.10 or newer;
-- Perforce Helix Core CLI (`p4`) with a working login and client mapping;
-- Git 2.x.
+Prerequisites: Codex with plugin and Hook support, Python 3.10+, `p4` with a working login/client mapping, and Git 2.x.
 
 ```powershell
 codex plugin marketplace add BillyCSZhao/codex-p4-diff
@@ -27,55 +23,33 @@ Restart Codex, approve the plugin Hooks, open the P4 project, and create a new t
 
 ## Behavior
 
-At task start, the plugin creates an external history repository under:
+At task start, the plugin initializes `<P4 ProjectRoot>/.git` and creates the fixed `codex/local-history` branch. It refuses to take over a pre-existing Git repository that does not contain its ownership marker under `.git/codex-p4-diff/project.json`. It never switches branches automatically.
 
-```text
-%LOCALAPPDATA%\CodexP4Diff\History\<project-name-hash>
+Every changed turn advances the shared branch by one `[Codex]` commit. Sessions are interleaved by turn completion time. A no-change turn creates no empty commit. The main Git index is updated only for paths recorded for that turn; the plugin never runs `git add -A`. If one of those paths already has staged content, the commit is refused. Staged content on unrelated paths is preserved.
+
+Files up to 8 MiB are eligible for commit content. Larger files retain hashes, sizes, and P4 metadata in the Git note without adding the full blob. Set `CODEX_P4_DIFF_MAX_BLOB_BYTES` to change the threshold.
+
+Each commit message contains the redacted request summary, session and turn IDs, project path, file actions, hashes, sizes, and history state. Read the complete note with:
+
+```powershell
+git notes --ref=codex-p4-diff show <commit>
 ```
 
-Every changed turn advances the task's session branch by one `[Codex]` commit. A no-change turn creates no empty commit. The external repository contains:
-
-```text
-files/<project-relative-path>        rolling small-file mirror
-turns/<sequence-turn-id>/event.json immutable turn details
-turns/<sequence-turn-id>/changes.patch exact text delta
-```
-
-Files up to 8 MiB are eligible for the rolling mirror. Larger files are represented by hashes, sizes, and P4 metadata so repeated Unreal binary changes do not grow local Git history without bound. Set `CODEX_P4_DIFF_MAX_BLOB_BYTES` to change the threshold.
-
-The first commit that touches an existing file shows the rolling mirror as a full-file addition because the branch did not previously contain that path. The same commit's `changes.patch` still contains the exact before/after text delta. Later commits show normal Git file diffs while the mirror matches the captured before state.
+The note contains timestamps, prompt SHA-256, before/after metadata, read-only P4 metadata, and the exact unified text patch when captured.
 
 ## Perforce boundary
 
-The runtime enforces this read-only P4 command whitelist:
+The runtime allows only `p4 info`, `where`, `fstat`, `diff`, `opened`, and `print`. It never creates, edits, reconciles, reopens, reverts, shelves, or submits a P4 changelist. P4 checkout and submission remain the responsibility of P4V, Unreal Source Control, or the user.
 
-```text
-p4 info
-p4 where
-p4 fstat
-p4 diff
-p4 opened
-p4 print
-```
+Cross-session same-path conflicts use a local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or change P4 changelist ownership.
 
-The plugin never creates or edits P4 changelists, checks out files, reconciles, reopens, reverts, shelves, or submits. P4 file checkout and submission remain the responsibility of P4V, Unreal Source Control, or the user.
+## Review and GitHub Desktop
 
-File ownership conflicts between Codex sessions use a local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or move P4 changelist ownership.
+Codex Review can inspect the latest commit or turn because the project itself is a Git checkout. `Unstaged` shows only changes not yet captured by the Stop hook.
 
-## View in GitHub Desktop
+In GitHub Desktop, choose **File > Add Local Repository** and select the P4 project root. Stay on `codex/local-history` and use **History** to inspect commits. Do not publish the repository.
 
-Run the installed launcher to get the exact history path:
-
-```powershell
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\scripts\run_codex_p4_diff.ps1" `
-  --workspace "C:\path\to\p4-project" `
-  --project-root "C:\path\to\p4-project" `
-  --history-path
-```
-
-Add the returned directory with **File > Add Local Repository**, then select the appropriate `codex/session/<session-id>` branch. Do not use **Publish repository**. The history repository has no remote and its `pre-push` hook rejects pushes.
-
-Because this Git repository is outside the P4 workspace, GitHub Desktop checkout, discard, and branch operations do not modify real P4 files.
+This Git repository uses the real P4 working tree. GitHub Desktop or Git commands such as checkout, switch, discard, restore, reset, clean, merge, and rebase can modify project files. Use the repository for history/review only; manage project-file restoration through the normal P4 workflow.
 
 ## Doctor and migration
 
@@ -86,17 +60,9 @@ Because this Git repository is outside the P4 workspace, GitHub Desktop checkout
   --doctor
 ```
 
-Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, and `legacyGitPointer`.
+Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, `branch`, and `legacyGitPointer`. `historyRoot` must equal the P4 project root and `branch` must be `codex/local-history`.
 
-Version 0.3 could attach a plugin-owned `.git` pointer to the P4 workspace and create P4 pending changelists. Version 0.4 stops all P4 mutations. At new-task startup it safely removes only a `.git` file pointing into the old Codex P4 Diff local-data directories. It does not remove a real Git repository, an unknown pointer, the old sidecar data, or any P4 changelist.
-
-To run only that migration manually:
-
-```powershell
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\scripts\run_codex_p4_diff.ps1" `
-  --workspace "C:\path\to\p4-project" `
-  --detach-legacy-review
-```
+Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Existing P4 changelists remain entirely user-managed.
 
 ## Update or remove
 
@@ -113,13 +79,11 @@ codex plugin remove codex-p4-diff@billycszhao-plugins
 codex plugin marketplace remove billycszhao-plugins
 ```
 
-Removing the plugin does not delete local history or old P4 changelists.
+Removing the plugin does not delete project `.git`, local Git history, state snapshots, external 0.4 history, or P4 changelists.
 
-## Security and data handling
+## Security and development
 
-The plugin runs local `p4` and `git` commands. It has no telemetry and does not send project contents to a plugin-owned service. Prompt summaries and source-code patches remain in the local history repository; see [PRIVACY.md](PRIVACY.md), [TERMS.md](TERMS.md), and [LICENSE](LICENSE).
-
-## Development
+The plugin has no telemetry and does not send project contents to a plugin-owned service. See [PRIVACY.md](PRIVACY.md), [TERMS.md](TERMS.md), and [LICENSE](LICENSE).
 
 ```powershell
 python -m unittest discover -s tests -v
