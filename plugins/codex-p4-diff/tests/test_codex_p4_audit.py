@@ -17,6 +17,40 @@ import codex_p4_audit as audit
 import codex_p4_diff as bridge
 
 
+class WindowsHookLauncherTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell")
+    def test_launcher_preserves_utf8_hook_input(self) -> None:
+        launcher = ROOT / "hooks" / "run_codex_p4_session.ps1"
+        with tempfile.TemporaryDirectory() as temp:
+            hook_root = Path(temp)
+            copied_launcher = hook_root / launcher.name
+            copied_launcher.write_bytes(launcher.read_bytes())
+            (hook_root / "codex_p4_session.py").write_text(
+                "import sys\n"
+                "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+                encoding="utf-8",
+            )
+            payload = json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "prompt": "中文需求摘要"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(copied_launcher),
+                ],
+                input=payload,
+                check=True,
+                capture_output=True,
+            )
+            echoed = json.loads(completed.stdout.decode("utf-8-sig"))
+            self.assertEqual(echoed["prompt"], "中文需求摘要")
+
+
 class AuditTestCase(unittest.TestCase):
     def make_context(
         self, data_root: Path, project: Path, session_id: str = "thread-123"

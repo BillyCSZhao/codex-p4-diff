@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Preserve UTF-8 hook input across the Windows PowerShell 5.1 launcher so Chinese prompt summaries remain intact in commit messages and audit notes.
+
 ## 0.5.0 - 2026-08-04
 
 - Initialize a real local Git repository directly at each P4 project root.

@@ -2,7 +2,10 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$utf8 = [Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $scriptPath = Join-Path $PSScriptRoot 'codex_p4_session.py'
 $candidates = @()
 
