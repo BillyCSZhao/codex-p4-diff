@@ -1,20 +1,20 @@
 # Codex P4 Diff
 
-[简体中文](README.zh-CN.md) | Current release: [v0.5.1](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.1)
+[简体中文](README.zh-CN.md) | Current release: [v0.5.2](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.2)
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
 - the P4 project root becomes one local Git repository on `codex/local-history`;
 - every changed user turn from every Codex session becomes one automatic local commit;
-- commit messages identify the session, turn, redacted request, paths, hashes, and sizes;
+- commit titles summarize the completed change, while the body preserves the redacted request, session, turn, paths, hashes, and sizes;
 - immutable audit details are stored in `refs/notes/codex-p4-diff`;
 - Perforce is restricted to read-only queries.
 
 The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
-## What's new in v0.5.1
+## What's new in v0.5.2
 
-The Windows PowerShell 5.1 Hook launcher now preserves UTF-8 input end to end. Chinese request summaries therefore remain readable in commit messages and audit notes instead of being replaced with `?`. Storage, commit, and Perforce behavior are otherwise unchanged from v0.5.0.
+Commit titles now describe what Codex changed instead of echoing the user's last prompt or confirmation. The Stop hook takes the first meaningful completed-change line from `last_assistant_message`, skips generic Markdown lines such as "Done" or "Tests passed", redacts secrets, and falls back to a deterministic file-action title such as `修改 A.cpp` when needed. The original request remains available as `Request` in the commit body and `promptSummary` in the Git note. Existing commits are not rewritten.
 
 ## Install
 
@@ -26,7 +26,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.1`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.2`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
@@ -36,15 +36,17 @@ At task start, the plugin initializes `<P4 ProjectRoot>/.git` and creates the fi
 
 Every changed turn advances the shared branch by one `[Codex]` commit. Sessions are interleaved by turn completion time. A no-change turn creates no empty commit. The main Git index is updated only for paths recorded for that turn; the plugin never runs `git add -A`. If one of those paths already has staged content, the commit is refused. Staged content on unrelated paths is preserved.
 
+The commit subject is `[Codex] <completed change>`. It is derived from the first meaningful line of the final assistant message after generic headings, status-only lines, Markdown markers, fenced code, and Codex directives are skipped. If no usable line exists, the plugin generates a title from file actions, for example `修改 A.cpp`, `新增 Config.ini`, or `更新 3 个文件：A.cpp、B.h 等`.
+
 Files up to 8 MiB are eligible for commit content. Larger files retain hashes, sizes, and P4 metadata in the Git note without adding the full blob. Set `CODEX_P4_DIFF_MAX_BLOB_BYTES` to change the threshold.
 
-Each commit message contains the redacted request summary, session and turn IDs, project path, file actions, hashes, sizes, and history state. Read the complete note with:
+Each commit body contains `Change`, `Change-Summary-Source`, the redacted original `Request`, session and turn IDs, project path, file actions, hashes, sizes, and history state. Read the complete note with:
 
 ```powershell
 git notes --ref=codex-p4-diff show <commit>
 ```
 
-The note contains timestamps, prompt SHA-256, before/after metadata, read-only P4 metadata, and the exact unified text patch when captured.
+The note contains `changeSummary`, `changeSummarySource`, `assistantMessageSha256`, `promptSummary`, prompt SHA-256, timestamps, before/after metadata, read-only P4 metadata, and the exact unified text patch when captured. Only the assistant message hash is stored; the full assistant response is not copied into the note.
 
 ## Perforce boundary
 
@@ -88,7 +90,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that the installed version is `0.5.1`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+Confirm that the installed version is `0.5.2`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins

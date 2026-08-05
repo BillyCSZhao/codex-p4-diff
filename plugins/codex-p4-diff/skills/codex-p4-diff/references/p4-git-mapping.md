@@ -26,12 +26,12 @@
 ~~~text
 codex/local-history
   Initialize Codex local history
-    └─ [Codex] session A / turn 1
-         └─ [Codex] session B / turn 1
-              └─ [Codex] session A / turn 2
+    └─ [Codex] 修复 NPC 资产命名规则
+         └─ [Codex] 新增 Config.ini
+              └─ [Codex] 更新 3 个文件：A.cpp、B.h 等
 ~~~
 
-project lock 序列化读取 HEAD、生成 commit、更新 notes/index/ref 的流程。commit message 和 note 都包含 session/turn，因此无需分支隔离也能追溯归属。
+project lock 序列化读取 HEAD、生成 commit、更新 notes/index/ref 的流程。commit 标题优先来自助手最终回复中的实际完成内容，无法提取时按文件动作生成；原始用户请求保留在正文和 note 中。commit message 和 note 都包含 session/turn，因此无需分支隔离也能追溯归属。
 
 ## 精确路径与漂移
 
@@ -51,7 +51,7 @@ project lock 序列化读取 HEAD、生成 commit、更新 notes/index/ref 的�
 
 ## 查看历史
 
-在 Codex Review 选择 `Last turn` 或最新 `Commit`。在 GitHub Desktop 添加项目根，保持 `codex/local-history`，从 History 选择 commit。完整收据运行：
+在 Codex Review 选择 `Last turn` 或最新 `Commit`。在 GitHub Desktop 添加项目根，保持 `codex/local-history`，从 History 选择 commit。标题表示实际完成的改动；原始请求查看正文 `Request`。完整收据运行：
 
 ~~~powershell
 git notes --ref=codex-p4-diff show <commit>
@@ -61,7 +61,7 @@ git notes --ref=codex-p4-diff show <commit>
 
 ## 迁移
 
-0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。
+0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。升级后的标题规则只影响新任务创建的新 commit，不改写已有历史。
 
 ## 常见问题
 
@@ -72,6 +72,10 @@ git notes --ref=codex-p4-diff show <commit>
 ### 回合结束没有 commit
 
 无文件变化不会创建空 commit。确认 Hook 在写入前识别了目标路径；升级后需重启 Codex、信任新版 Hooks并新建任务。
+
+### commit 标题仍然是用户回复
+
+确认安装版本至少为 `0.5.2`。旧任务不会热加载新版 Stop hook；重启 Codex、重新信任 Hooks 并新建任务。已有 commit 保持不可变，可在正文或 note 中区分实际改动和原始请求。
 
 ### Review 的 Unstaged 为空
 

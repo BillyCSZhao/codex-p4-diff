@@ -147,6 +147,93 @@ def redact_summary(text: str, limit: int = 180) -> str:
     return value[:limit]
 
 
+GENERIC_ASSISTANT_SUMMARY_LINES = {
+    '已完成',
+    '完成',
+    '处理完成',
+    '已处理',
+    '完成情况',
+    '完成内容',
+    '更新内容',
+    '修改内容',
+    '改动内容',
+    '主要改动',
+    '结果',
+    '验证',
+    '验证通过',
+    '测试通过',
+    'done',
+    'completed',
+    'summary',
+    'changes',
+    'results',
+    'verification',
+    'testspassed',
+}
+
+
+def strip_basic_markdown(line: str) -> str:
+    value = re.sub(r'^\s{0,3}(?:#{1,6}\s+|>\s*)', '', line)
+    value = re.sub(r'^\s*(?:[-+*]\s+|\d+[.)]\s+)', '', value)
+    value = re.sub(r'^\s*\[[ xX]\]\s+', '', value)
+    value = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', value)
+    value = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', value)
+    value = value.replace('**', '').replace('__', '').replace('~~', '').replace(chr(96), '')
+    return re.sub(r'\s+', ' ', value).strip()
+
+
+def extract_assistant_change_summary(message: Any) -> str | None:
+    text = str(message or '')
+    in_fence = False
+    fence = chr(96) * 3
+    for raw_line in text.splitlines():
+        if raw_line.strip().startswith(fence) or raw_line.strip().startswith('~~~'):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        line = strip_basic_markdown(raw_line)
+        if not line or line.startswith('::') or line.startswith('<oai-'):
+            continue
+        normalized = re.sub(r'[\s。.!！,:：;；]+', '', line).casefold()
+        if normalized in GENERIC_ASSISTANT_SUMMARY_LINES:
+            continue
+        return redact_summary(line)
+    return None
+
+
+def fallback_change_summary(changes: list[dict[str, Any]]) -> str:
+    if not changes:
+        return '更新文件'
+    names = [
+        Path(str(change.get('path') or '')).name or str(change.get('path') or '')
+        for change in changes
+    ]
+    if len(changes) == 1:
+        verb = {'add': '新增', 'delete': '删除', 'edit': '修改'}.get(
+            str(changes[0].get('action') or ''), '更新'
+        )
+        return redact_summary(f'{verb} {names[0]}')
+    preview = '、'.join(names[:2])
+    suffix = ' 等' if len(names) > 2 else ''
+    return redact_summary(f'更新 {len(changes)} 个文件：{preview}{suffix}')
+
+
+def build_change_summary(
+    event: dict[str, Any], changes: list[dict[str, Any]]
+) -> tuple[str, str, str | None]:
+    assistant_message = str(event.get('last_assistant_message') or '')
+    assistant_sha256 = (
+        sha256_bytes(assistant_message.encode('utf-8', errors='surrogatepass'))
+        if assistant_message
+        else None
+    )
+    summary = extract_assistant_change_summary(assistant_message)
+    if summary:
+        return summary, 'assistant', assistant_sha256
+    return fallback_change_summary(changes), 'files', assistant_sha256
+
+
 def normalize_session_id(value: Any) -> str:
     session_id = str(value or "").strip()
     if not session_id:
@@ -743,7 +830,8 @@ def create_turn_commit(
     prompt: dict[str, Any],
     changes: list[dict[str, Any]],
     patches: list[str],
-) -> tuple[str, str]:
+    stop_event: dict[str, Any],
+) -> tuple[str, str, dict[str, str | None]]:
     parent = current_history_head(ctx)
     sequence = int(session.get("nextSequence") or 1)
     updates: dict[str, bytes | None] = {}
@@ -775,7 +863,16 @@ def create_turn_commit(
                 history_state = "delete-receipt-only"
         change["historyState"] = history_state
 
+    change_summary, change_summary_source, assistant_message_sha256 = build_change_summary(
+        stop_event, changes
+    )
+    summary_record = {
+        'changeSummary': change_summary,
+        'changeSummarySource': change_summary_source,
+        'assistantMessageSha256': assistant_message_sha256,
+    }
     event_record = {
+        **summary_record,
         "schemaVersion": bridge.SCHEMA_VERSION,
         "generatedBy": bridge.TOOL_NAME,
         "sessionId": ctx.session_id,
@@ -791,11 +888,13 @@ def create_turn_commit(
         "textPatch": "\n".join(patches) if patches else None,
     }
 
-    summary = str(prompt.get("summary") or "Codex file changes")
-    subject = f"[Codex] {summary}"[:120]
+    subject = f"[Codex] {change_summary}"[:120]
     body = [
         subject,
         "",
+        f"Change: {change_summary}",
+        f"Change-Summary-Source: {change_summary_source}",
+        f"Request: {prompt.get('summary') or 'Codex file changes'}",
         f"Session: {ctx.session_id}",
         f"Turn: {turn_id}",
         f"Recorded-At: {event_record['recordedAt']}",
@@ -835,7 +934,7 @@ def create_turn_commit(
     except (bridge.CodexP4DiffError, OSError):
         sync_main_index(ctx, parent_entries)
         raise
-    return commit, "refs/notes/codex-p4-diff"
+    return commit, "refs/notes/codex-p4-diff", summary_record
 
 
 def record_prompt(ctx: AuditContext, event: dict[str, Any]) -> str:
@@ -970,8 +1069,8 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
             return {"status": "no-changes", "branch": ctx.branch, "historyRoot": str(ctx.history_root)}
 
         try:
-            commit, audit_path = create_turn_commit(
-                ctx, session, turn_id, prompt, changes, patches
+            commit, audit_path, summary_record = create_turn_commit(
+                ctx, session, turn_id, prompt, changes, patches, event
             )
         except (bridge.CodexP4DiffError, OSError) as exc:
             turn_state.update({"status": "commit-failed", "error": str(exc), "finishedAt": utc_now()})
@@ -986,7 +1085,9 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
                 "commit": commit,
                 "auditNotesRef": audit_path,
                 "fileCount": len(changes),
-                "summary": prompt.get("summary"),
+                "summary": summary_record["changeSummary"],
+                "summarySource": summary_record["changeSummarySource"],
+                "requestSummary": prompt.get("summary"),
                 "finishedAt": utc_now(),
             }
         )
@@ -998,6 +1099,8 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
             "commit": commit,
             "branch": ctx.branch,
             "files": len(changes),
+            "summary": summary_record["changeSummary"],
+            "summarySource": summary_record["changeSummarySource"],
             "historyRoot": str(ctx.history_root),
         }
 

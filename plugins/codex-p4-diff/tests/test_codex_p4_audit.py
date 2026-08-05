@@ -88,9 +88,14 @@ class AuditTestCase(unittest.TestCase):
             },
         )
 
-    def finalize(self, ctx: audit.AuditContext, turn_id: str) -> dict[str, object]:
+    def finalize(
+        self, ctx: audit.AuditContext, turn_id: str, assistant_message: str | None = None
+    ) -> dict[str, object]:
+        event = {'hook_event_name': 'Stop', 'turn_id': turn_id}
+        if assistant_message is not None:
+            event['last_assistant_message'] = assistant_message
         with mock.patch.object(bridge, "readonly_fstat", return_value=None):
-            return audit.finalize_turn(ctx, {"hook_event_name": "Stop", "turn_id": turn_id})
+            return audit.finalize_turn(ctx, event)
 
 
 class AuditHelpersTest(AuditTestCase):
@@ -127,6 +132,35 @@ class AuditHelpersTest(AuditTestCase):
             "Fix login token=<redacted> password=<redacted> Bearer <redacted>",
         )
 
+    def test_extract_assistant_change_summary_skips_generic_markdown(self) -> None:
+        message = (
+            '## 完成情况\n\n'
+            '已完成。\n\n'
+            'Tests passed.\n\n'
+            '- **修复提交记录标题**：现在使用实际改动摘要。\n'
+            '- 测试通过。'
+        )
+        self.assertEqual(
+            audit.extract_assistant_change_summary(message),
+            '修复提交记录标题：现在使用实际改动摘要。',
+        )
+
+    def test_fallback_change_summary_uses_file_actions(self) -> None:
+        self.assertEqual(
+            audit.fallback_change_summary([{'action': 'edit', 'path': 'Source/A.cpp'}]),
+            '修改 A.cpp',
+        )
+        self.assertEqual(
+            audit.fallback_change_summary(
+                [
+                    {'action': 'add', 'path': 'Config/Config.ini'},
+                    {'action': 'edit', 'path': 'Source/A.cpp'},
+                    {'action': 'delete', 'path': 'Source/B.h'},
+                ]
+            ),
+            '更新 3 个文件：Config.ini、A.cpp 等',
+        )
+
     def test_mutating_shell_classifier(self) -> None:
         self.assertTrue(audit.likely_mutating_shell("Set-Content -Path a.txt -Value x"))
         self.assertTrue(audit.likely_mutating_shell("clang-format -i Source/a.cpp"))
@@ -149,12 +183,14 @@ class TurnCommitIntegrationTest(AuditTestCase):
             self.start_turn(ctx, "turn-1", "Change greeting")
             audit.record_before_path(ctx, "turn-1", target)
             target.write_text("after one\n", encoding="utf-8")
-            first = self.finalize(ctx, "turn-1")
+            first_message = '将问候语更新为第一版。'
+            first = self.finalize(ctx, "turn-1", first_message)
 
             self.start_turn(ctx, "turn-2", "Refine greeting")
             audit.record_before_path(ctx, "turn-2", target)
             target.write_text("after two\n", encoding="utf-8")
-            second = self.finalize(ctx, "turn-2")
+            second_message = '将问候语调整为最终版本。'
+            second = self.finalize(ctx, "turn-2", second_message)
 
             self.assertEqual(first["status"], "committed")
             self.assertEqual(second["status"], "committed")
@@ -185,18 +221,43 @@ class TurnCommitIntegrationTest(AuditTestCase):
                 capture_output=True,
                 text=True,
             ).stdout
-            self.assertIn("[Codex] Change greeting", log)
-            self.assertIn("[Codex] Refine greeting", log)
+            self.assertIn("[Codex] 将问候语更新为第一版。", log)
+            self.assertIn("[Codex] 将问候语调整为最终版本。", log)
             message = subprocess.run(
                 [ctx.git_exe, "-C", str(ctx.history_root), "show", "-s", "--format=%B", str(second["commit"])],
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout
+            self.assertIn("Change: 将问候语调整为最终版本。", message)
+            self.assertIn("Change-Summary-Source: assistant", message)
+            self.assertIn("Request: Refine greeting", message)
             self.assertIn("Session: thread-123", message)
             self.assertIn("Turn: turn-2", message)
             self.assertIn("Recorded-At:", message)
             self.assertIn("p4=-@-/-", message)
+            note = subprocess.run(
+                [
+                    ctx.git_exe,
+                    "-C",
+                    str(ctx.history_root),
+                    "notes",
+                    "--ref=codex-p4-diff",
+                    "show",
+                    str(second["commit"]),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            receipt = json.loads(note)
+            self.assertEqual(receipt["changeSummary"], "将问候语调整为最终版本。")
+            self.assertEqual(receipt["changeSummarySource"], "assistant")
+            self.assertEqual(
+                receipt["assistantMessageSha256"],
+                audit.sha256_bytes(second_message.encode("utf-8")),
+            )
+            self.assertEqual(receipt["promptSummary"], "Refine greeting")
 
     def test_exact_first_touch_patch_is_committed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -227,6 +288,60 @@ class TurnCommitIntegrationTest(AuditTestCase):
             patch_text = json.loads(patch_text)["textPatch"]
             self.assertIn("-user baseline", patch_text)
             self.assertIn("+codex result", patch_text)
+
+    def test_missing_assistant_message_uses_file_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / 'workspace' / 'Project'
+            project.mkdir(parents=True)
+            target = project / 'Source' / 'A.cpp'
+            target.parent.mkdir()
+            target.write_text('before\n', encoding='utf-8')
+            ctx = self.make_context(data_root / 'local', project)
+
+            self.start_turn(ctx, 'turn-fallback', '按你推荐的做吧')
+            audit.record_before_path(ctx, 'turn-fallback', target)
+            target.write_text('after\n', encoding='utf-8')
+            result = self.finalize(ctx, 'turn-fallback')
+
+            message = subprocess.run(
+                [
+                    ctx.git_exe,
+                    '-C',
+                    str(ctx.history_root),
+                    'show',
+                    '-s',
+                    '--format=%B',
+                    str(result['commit']),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertTrue(message.startswith('[Codex] 修改 A.cpp\n'))
+            self.assertIn('Change-Summary-Source: files', message)
+            self.assertIn('Request: 按你推荐的做吧', message)
+            self.assertEqual(result['summary'], '修改 A.cpp')
+            self.assertEqual(result['summarySource'], 'files')
+            note = subprocess.run(
+                [
+                    ctx.git_exe,
+                    '-C',
+                    str(ctx.history_root),
+                    'notes',
+                    '--ref=codex-p4-diff',
+                    'show',
+                    str(result['commit']),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            receipt = json.loads(note)
+            self.assertEqual(receipt['changeSummary'], '修改 A.cpp')
+            self.assertEqual(receipt['changeSummarySource'], 'files')
+            self.assertIsNone(receipt['assistantMessageSha256'])
+            self.assertEqual(receipt['promptSummary'], '按你推荐的做吧')
 
     def test_no_change_turn_creates_no_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

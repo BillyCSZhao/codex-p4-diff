@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2 - 2026-08-05
+
+- Build each commit title from the first meaningful completed-change line in the Stop hook's `last_assistant_message` instead of echoing the user's prompt.
+- Preserve the redacted original request in `Request` and `promptSummary` while recording `changeSummary`, `changeSummarySource`, and `assistantMessageSha256` for auditability.
+- Fall back to deterministic file-action titles when no usable assistant summary is available.
+- Leave all existing local history unchanged; only new commits created by updated tasks use the new title format.
+
 ## 0.5.1 - 2026-08-04
 
 - Preserve UTF-8 hook input across the Windows PowerShell 5.1 launcher so Chinese prompt summaries remain intact in commit messages and audit notes.

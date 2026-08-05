@@ -1,20 +1,20 @@
 # Codex P4 Diff
 
-[English](README.md) | 当前公开版本：[v0.5.1](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.1)
+[English](README.md) | 当前公开版本：[v0.5.2](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.2)
 
 Codex P4 Diff 在 P4 工程根建立一个仅供本地审阅的 Git 历史，不修改 Perforce：
 
 - 所有 Codex 会话共用固定的 `codex/local-history` 分支；
 - 每个有文件变化的用户回合自动创建一个本地 Git commit；
-- commit message 记录会话、回合、脱敏需求摘要、路径、前后哈希和大小；
+- commit 标题描述实际完成的改动，正文保留脱敏后的原始需求、会话、回合、路径、前后哈希和大小；
 - `refs/notes/codex-p4-diff` 保存完整审计收据和可获取的精确文本补丁；
 - P4 只允许只读查询，不创建、修改或提交 changelist。
 
 工程内的本地 Git 仓库没有 remote，并安装 `pre-push` hook 阻止发布。真实工程相对路径可以直接在 Codex Review 和 GitHub Desktop 中审阅。
 
-## v0.5.1 更新
+## v0.5.2 更新
 
-Windows PowerShell 5.1 Hook 启动器现在全程使用 UTF-8。中文需求摘要不会再在 commit message 或审计 notes 中变成 `?`。本次更新不改变 v0.5.0 的存储结构、自动 commit 规则或 P4 只读边界。
+commit 标题不再照抄用户最后一句请求或确认回复。Stop hook 会从 `last_assistant_message` 提取第一条有效的完成内容，跳过“已完成”“测试通过”“完成情况”等空泛 Markdown 行并脱敏；没有可用内容时，按文件动作生成“修改 A.cpp”“新增 Config.ini”“更新 3 个文件：A.cpp、B.h 等”这类稳定标题。原始请求仍保留在 commit 正文的 `Request` 和 Git note 的 `promptSummary` 中。旧 commit 不会被改写。
 
 ## 安装
 
@@ -26,7 +26,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-确认 `codex-p4-diff@billycszhao-plugins` 的版本为 `0.5.1`。如果 Windows PowerShell 执行策略阻止 `codex.ps1`，把命令中的 `codex` 改成 `codex.cmd`。
+确认 `codex-p4-diff@billycszhao-plugins` 的版本为 `0.5.2`。如果 Windows PowerShell 执行策略阻止 `codex.ps1`，把命令中的 `codex` 改成 `codex.cmd`。
 
 安装后重启 Codex，信任插件 Hooks，在 P4 工程目录中创建新任务。已经打开的旧任务不会热加载新版 Hook。
 
@@ -38,7 +38,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-如果 `plugin add` 提示已经安装，或者版本仍低于 `0.5.1`，只重装公开 marketplace 下的这个插件：
+如果 `plugin add` 提示已经安装，或者版本仍低于 `0.5.2`，只重装公开 marketplace 下的这个插件：
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
@@ -53,6 +53,10 @@ codex plugin list --json
 任务开始时，插件在 P4 工程根初始化或验证自己拥有的 `.git`，并检查固定分支、无 remote 和 push 阻断。插件不会接管已有的外来 Git 仓库，也不会自动切换分支。
 
 每个有文件变化的回合会生成一条 `[Codex]` commit。不同会话按回合完成时间依次进入同一分支，无变化回合不创建空 commit。插件只处理当前回合记录到的路径，不运行 `git add -A`；同一路径已有 staged 内容时会拒绝提交，不相关 staged 内容保持不变。
+
+commit 标题格式为 `[Codex] <实际完成的改动>`。插件从助手最终回复中提取第一条有效内容，并跳过空泛标题、纯状态行、代码块和 Codex 指令。无法提取时，按本回合文件动作和文件名生成确定性标题。
+
+commit 正文包含 `Change`、`Change-Summary-Source`、脱敏后的原始 `Request`、session/turn ID、文件动作、哈希、大小和历史状态。完整 note 还包含 `changeSummary`、`changeSummarySource`、`assistantMessageSha256`、`promptSummary`、prompt SHA-256、P4 只读元数据和可获取的精确文本补丁。note 只保存助手回复的哈希，不复制完整回复正文。
 
 默认只把不超过 8 MiB 的文件内容写入 Git。更大的文件仍会在 notes 中记录哈希、大小和 P4 元数据。可通过 `CODEX_P4_DIFF_MAX_BLOB_BYTES` 调整阈值。
 
@@ -106,6 +110,7 @@ $Runner = Join-Path $SkillRoot 'scripts\run_codex_p4_diff.ps1'
 - 0.3 可能创建过 P4 pending CL；0.5 不修改这些 CL，由用户继续在 P4V 中管理。
 - 0.4 的外置历史不会被 0.5 导入或删除，可作为旧记录保留。
 - 回合结束没有 commit：确认该回合确实改了文件，并确认升级后已经重启 Codex、信任 Hooks、新建任务。
+- 新 commit 标题仍显示用户回复：旧任务不会热加载新版 Hook；确认版本为 `0.5.2` 后重启 Codex、重新信任 Hooks并新建任务。旧 commit 保持原样。
 - `Unstaged` 为空：切换到 `Last turn` 或最新 `Commit`。
 - Doctor 显示 `ready=false`：检查 P4 登录和映射、Git 是否可用、工程是否已有外来 `.git`、是否配置了 remote，以及当前分支是否为 `codex/local-history`。
 - 同一路径被另一会话锁定：正常结束原任务以触发 `SessionEnd`；异常退出的所有权记录会在 24 小时后过期。

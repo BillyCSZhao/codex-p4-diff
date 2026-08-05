@@ -8,7 +8,7 @@ The plugin invokes locally installed `p4` and `git` programs. Perforce is restri
 
 Installing or updating downloads plugin source from GitHub through Codex's marketplace mechanism; GitHub's privacy terms apply.
 
-Local Git history is stored in `.git` at the P4 project root. Commits may contain source file content up to the configured size threshold. Commit messages and `refs/notes/codex-p4-diff` may contain local project paths, redacted prompt summaries, prompt SHA-256 values, text patches, file actions, before/after hashes and sizes, Perforce connection identifiers, depot paths, and revision metadata.
+Local Git history is stored in `.git` at the P4 project root. Commits may contain source file content up to the configured size threshold. Commit messages and `refs/notes/codex-p4-diff` may contain local project paths, redacted completed-change summaries, redacted prompt summaries, prompt and assistant-message SHA-256 values, summary-source metadata, text patches, file actions, before/after hashes and sizes, Perforce connection identifiers, depot paths, and revision metadata. The full assistant response is not copied into the Git note.
 
 The default content threshold is 8 MiB. Larger files are represented by hashes, sizes, and Perforce metadata. Temporary write-before snapshots, session ledgers, and ownership records remain under `%LOCALAPPDATA%\CodexP4Diff\State` on Windows or the platform-equivalent local state directory.
 
