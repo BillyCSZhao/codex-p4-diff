@@ -2491,7 +2491,8 @@ class RecoveryAndSafetyTest(AuditTestCase):
                 "turn_id": "turn-new-session",
                 "prompt": "Recover prior session",
             }
-            audit.record_prompt(second, later_prompt)
+            with mock.patch.object(bridge, "readonly_fstat", return_value=None):
+                audit.record_prompt(second, later_prompt)
             self.assertEqual(
                 later_prompt["_codexP4DiffRecovery"]["status"], "committed"
             )
