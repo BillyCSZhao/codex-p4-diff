@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4 - 2026-08-08
+
+- Replace age-deleted project lock files with bounded operating-system file locks that require no sentinel writes, and migrate ownership to schema 8 renewable short leases with random registry epochs and per-claim tokens that cannot be reused after registry rebuild.
+- Journal Git finalization as an idempotent transaction so interrupted ref, note, and index updates resume without duplicating a turn commit.
+- Add project-level recovery markers so any later session can finish an earlier deferred turn; serialize first-writer Stop-time snapshot publication, seal its ownership attribution, and release the old claim only after sealing succeeds so another session can continue immediately. Duplicate or slower timeout handlers cannot replace an already published snapshot or release its claim before sealing. If freezing fails, fall back to `deferred-after-unavailable-receipt-only` without reading later worktree content.
+- Merge terminal turn state under the short shared-state lock so cross-session recovery cannot overwrite a concurrently created prompt, active turn, or ownership claim.
+- Preserve pre-existing same-path staged content as `staged-receipt-only` instead of refusing the whole turn; serialize compare-and-update with Git's index lock, retry transient Windows replace contention, and atomically install a temporary index so unrelated or concurrent staged entries remain untouched.
+- Expand statically resolvable shell writes across command chains, call operators, directories, and globs, while recording explicit `partial` coverage warnings for dynamic or unresolved targets without blocking the command.
+- Reserve ownership and before-manifest entries under a short shared-state lock, then capture file bytes under per-turn, per-path locks so a slow snapshot cannot make unrelated tasks miss ownership auditing.
+- Compact uncertainty evidence to at most two writer summaries plus one normal timeout fallback; atomically ingest the fallback and promote its anonymous high-water mark at compaction so out-of-order writers and cleanup races cannot hide a concurrent write.
+- Keep ordinary audit failures fail-open and preserve the runtime Perforce read-only command boundary.
+
 ## 0.5.3 - 2026-08-07
 
 - Parse shell commands with quote awareness so ordinary strings such as PowerShell's `'Stop'` and regex characters such as `>` are not mistaken for project paths or redirections.

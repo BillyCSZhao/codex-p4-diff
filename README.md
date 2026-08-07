@@ -1,6 +1,6 @@
 # Codex P4 Diff
 
-[简体中文](README.zh-CN.md) | Current release: [v0.5.3](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.3)
+[简体中文](README.zh-CN.md) | Current release: [v0.5.4](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.4)
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
@@ -12,9 +12,11 @@ Codex P4 Diff records Codex changes as local Git history without modifying Perfo
 
 The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
-## What's new in v0.5.3
+## What's new in v0.5.4
 
-Shell auditing now distinguishes explicit write targets from ordinary quoted text. PowerShell values such as `$ErrorActionPreference = 'Stop'`, regex characters such as `>`, and directory/Junction creation no longer become fake project-file locks. Same-path ownership is scoped to the active turn and released after a successful commit or a no-change Stop. Failed finalization keeps ownership for safe retry, and the first updated task removes invalid legacy string records from local ownership state.
+Project commit serialization now uses bounded operating-system file locks instead of deleting lock files by age. Same-path ownership uses schema 8 renewable short leases plus random registry epochs and per-claim tokens, so a deleted or rebuilt registry cannot reuse an older turn's token. Git finalization is journaled as an idempotent transaction: interrupted ref, note, and index updates resume without duplicating a turn commit. Project-level recovery markers let a later session finish an earlier session's deferred turn, while terminal state is merged under the short shared-state lock so recovery cannot overwrite a concurrently created prompt or claim.
+
+Pre-existing same-path staged content is preserved as `staged-receipt-only` instead of rejecting the turn. When Stop defers before creating a transaction, a turn-scoped lock makes the first frozen after snapshot immutable; the plugin releases the old claim only after that snapshot's ownership attribution is sealed. If another handler is still publishing the snapshot, the claim remains until sealing succeeds. If the after snapshot cannot be frozen, recovery creates a partial `deferred-after-unavailable-receipt-only` and never reads later worktree content into the old turn. Shell auditing expands statically resolvable command chains, call operators, directory destinations, and globs. Dynamic or unresolved writes are explicitly recorded as `partial` coverage warnings and surfaced to the task without blocking the command. Ordinary audit errors also fail open; only a confirmed live same-path ownership conflict denies a write. Perforce remains read-only throughout.
 
 ## Install
 
@@ -26,17 +28,21 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.3`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.4`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
 ## Behavior
 
-At task start, the plugin initializes `<P4 ProjectRoot>/.git` and creates the fixed `codex/local-history` branch. It refuses to take over a pre-existing Git repository that does not contain its ownership marker under `.git/codex-p4-diff/project.json`. It never switches branches automatically.
+At task start, the plugin initializes `<P4 ProjectRoot>/.git` and creates the fixed `codex/local-history` branch. Legacy `.git` pointer migration and repository initialization are serialized by `.repo-setup.lock`. The plugin refuses to take over a pre-existing Git repository that does not contain its ownership marker under `.git/codex-p4-diff/project.json`, and it never switches branches automatically.
 
-Every changed turn advances the shared branch by one `[Codex]` commit. Sessions are interleaved by turn completion time. A no-change turn creates no empty commit. The main Git index is updated only for paths recorded for that turn; the plugin never runs `git add -A`. If one of those paths already has staged content, the commit is refused. Staged content on unrelated paths is preserved.
+Every changed turn advances the shared branch by one `[Codex]` commit. Sessions are interleaved by turn completion time. A no-change turn creates no empty commit. The main Git index is updated only for paths recorded for that turn; the plugin never runs `git add -A`. Pre-existing staged content on a recorded path is left untouched and represented as `staged-receipt-only`, while other eligible paths may still enter the commit. Unrelated staged content is also preserved. Final comparison and replacement use Git's standard `index.lock`: updates are built in a temporary index and atomically installed, so a stage that wins before the lock is skipped and no stage can appear between comparison and replacement.
 
-Shell commands participate in same-path protection only when the hook can identify a high-confidence file write target, such as `-LiteralPath`, `-Path`, `-Destination`, `-FilePath`, or an unquoted redirection target. Quoted messages, regex patterns, enum values, and directory/Junction targets are not claimed as files.
+Shell commands participate in same-path protection only when the hook can identify statically resolvable file targets. It understands common named and positional write arguments, command chains, PowerShell's call operator, redirections, and existing directory or glob targets. Directory targets are expanded to their current project files rather than claimed as a directory lock. Quoted messages, comments, regex patterns, and option values are not treated as paths. Dynamic syntax, unresolved variables, response files, links, or expansion limits produce explicit `partial` coverage warnings instead of guessed paths; the command continues.
+
+Separate bounded OS-level locks have narrow responsibilities: `.repo-setup.lock` serializes legacy-pointer migration and repository initialization, `.state.lock` protects ownership and session ledgers, `.project.lock` serializes Git finalization, per-turn/per-path locks isolate before snapshots, `.deferred-after.lock` makes the first Stop-time snapshot immutable, uncertainty scopes use their own short locks, and Git's `index.lock` protects the final index replacement. The current implementation writes no sentinel payload to lock files, so concurrent initialization never writes into a byte already locked by another process. The phase-based transaction journal is written before the branch, note, or index is advanced. If history is busy before a transaction can be created, the Stop hook freezes the current after snapshot, seals whether each path still belonged to that turn, releases those claims, and writes a project-level recovery marker. Any later prompt or session can resume that turn; repeated failure does not block a new turn. Terminal updates briefly reacquire `.state.lock`, reload the latest ledger, merge only the completed turn, and release only that turn's claims.
+
+`PreToolUse` publishes the ownership claim and a lightweight before-manifest reservation while holding only the short shared-state lock. It then reads file content under a per-turn, per-path lock and briefly reacquires shared state to merge the snapshot metadata. Slow or large snapshots therefore do not make unrelated sessions fall through the state-lock timeout. A path discovered only by `PostToolUse`, or a failed before snapshot, becomes an explicit partial `after-only-receipt`; it never fabricates an add/delete patch or blocks the tool. Each uncertainty scope retains at most two writer summaries plus one normal timeout `pending.json`; compaction atomically ingests that file and promotes its anonymous timestamp to compaction time, preserving evidence across out-of-order writers and concurrent cleanup.
 
 The commit subject is `[Codex] <completed change>`. It is derived from the first meaningful line of the final assistant message after generic headings, status-only lines, Markdown markers, fenced code, and Codex directives are skipped. If no usable line exists, the plugin generates a title from file actions, for example `修改 A.cpp`, `新增 Config.ini`, or `更新 3 个文件：A.cpp、B.h 等`.
 
@@ -54,7 +60,9 @@ The note contains `changeSummary`, `changeSummarySource`, `assistantMessageSha25
 
 The runtime allows only `p4 info`, `where`, `fstat`, `diff`, `opened`, and `print`. It never creates, edits, reconciles, reopens, reverts, shelves, or submits a P4 changelist. P4 checkout and submission remain the responsibility of P4V, Unreal Source Control, or the user.
 
-Cross-session same-path conflicts use a turn-scoped local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or change P4 changelist ownership. Successful and no-change turns release their paths immediately. Failed or interrupted turns retain real-path ownership for retry, with a 24-hour stale fallback.
+Cross-session same-path conflicts use a turn-scoped local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or change P4 changelist ownership. Schema 8 records use a renewable ten-minute lease and a registry-epoch claim token. They are live only while session, active turn, status, before-manifest, and token agree. Windows ownership keys are case-insensitive while the original display casing is retained. A takeover changes the token, so an older turn becomes receipt-only even after the newer owner releases the path. Expired or inactive records are reclaimed.
+
+Incomplete shell coverage and ordinary audit errors are reported as warnings and do not block the underlying tool. A `PreToolUse` denial is reserved for a confirmed live same-path conflict with another Codex session or turn.
 
 ## Review and GitHub Desktop
 
@@ -82,7 +90,7 @@ $Runner = Join-Path $SkillRoot 'scripts\run_codex_p4_diff.ps1'
 
 Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, `branch`, and `legacyGitPointer`. `historyRoot` must equal the P4 project root and `branch` must be `codex/local-history`.
 
-Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Version 0.5.3 also migrates local ownership state and drops non-path records produced by older shell parsing. Existing P4 changelists remain entirely user-managed.
+Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Version 0.5.3 dropped non-path ownership records produced by older shell parsing. Version 0.5.4 migrates ownership to schema 8, retaining only active before-manifest paths and replacing historical counters with bounded epoch-scoped claim tokens. Existing P4 changelists remain entirely user-managed.
 
 ## Update or remove
 
@@ -92,7 +100,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that the installed version is `0.5.3`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+Confirm that the installed version is `0.5.4`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
