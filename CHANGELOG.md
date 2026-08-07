@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.3 - 2026-08-07
+
+- Parse shell commands with quote awareness so ordinary strings such as PowerShell's `'Stop'` and regex characters such as `>` are not mistaken for project paths or redirections.
+- Claim shell paths only when they are explicit write targets, while ignoring directory and Junction creation.
+- Scope same-path ownership to the active turn and release it after a successful commit or a no-change Stop; retain it after failed finalization for safe retry.
+- Migrate legacy ownership state on the first updated task and discard non-path records produced by older shell parsing.
+
 ## 0.5.2 - 2026-08-05
 
 - Build each commit title from the first meaningful completed-change line in the Stop hook's `last_assistant_message` instead of echoing the user's prompt.

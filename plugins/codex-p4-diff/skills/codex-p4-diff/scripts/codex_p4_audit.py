@@ -21,6 +21,7 @@ import codex_p4_diff as bridge
 
 MAX_CAPTURE_BYTES = int(os.environ.get("CODEX_P4_DIFF_MAX_BLOB_BYTES", 8 * 1024 * 1024))
 LOCK_STALE_SECONDS = 24 * 60 * 60
+OWNERSHIP_SCHEMA_VERSION = 6
 MUTATING_TOOLS = {"apply_patch", "Edit", "Write", "Bash", "shell_command"}
 IGNORED_TOP_LEVEL = {
     ".git",
@@ -55,6 +56,13 @@ class AuditContext:
     state_root: Path
     session_root: Path
     git_exe: str
+
+
+@dataclass(frozen=True)
+class ShellToken:
+    value: str
+    quoted: bool = False
+    operator: bool = False
 
 
 def utc_now() -> str:
@@ -388,51 +396,283 @@ def parse_apply_patch_paths(command: str, cwd: Path, project_root: Path) -> list
     return paths
 
 
+SHELL_MUTATING_COMMANDS = {
+    "add-content",
+    "apply_patch",
+    "clear-content",
+    "copy-item",
+    "cp",
+    "clang-format",
+    "move-item",
+    "mv",
+    "new-item",
+    "out-file",
+    "prettier",
+    "remove-item",
+    "rename-item",
+    "rm",
+    "sed",
+    "set-content",
+    "tee",
+    "touch",
+}
+SHELL_COMMAND_SEPARATORS = {";", "|", "\n", "\r", "{", "}"}
+
+
+def shell_tokens(command: str) -> list[ShellToken]:
+    """Tokenize enough PowerShell/POSIX syntax to keep strings out of path detection."""
+    tokens: list[ShellToken] = []
+    value: list[str] = []
+    quote = ""
+    token_quoted = False
+    index = 0
+
+    def flush() -> None:
+        nonlocal token_quoted
+        if value:
+            tokens.append(ShellToken("".join(value), quoted=token_quoted))
+            value.clear()
+        token_quoted = False
+
+    while index < len(command):
+        char = command[index]
+        if quote:
+            if char == quote:
+                if quote == "'" and index + 1 < len(command) and command[index + 1] == "'":
+                    value.append("'")
+                    index += 2
+                    continue
+                quote = ""
+                token_quoted = True
+                index += 1
+                continue
+            if quote == '"' and char == "`" and index + 1 < len(command):
+                value.append(command[index + 1])
+                index += 2
+                continue
+            value.append(char)
+            index += 1
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            token_quoted = True
+            index += 1
+            continue
+        if char == "`" and index + 1 < len(command):
+            value.append(command[index + 1])
+            index += 2
+            continue
+        if char.isspace():
+            flush()
+            if char in {"\n", "\r"}:
+                tokens.append(ShellToken(char, operator=True))
+            index += 1
+            continue
+        if char in {";", "|", "{", "}", "="}:
+            flush()
+            tokens.append(ShellToken(char, operator=True))
+            index += 1
+            continue
+        if char == ">":
+            flush()
+            operator = ">>" if index + 1 < len(command) and command[index + 1] == ">" else ">"
+            tokens.append(ShellToken(operator, operator=True))
+            index += len(operator)
+            continue
+        value.append(char)
+        index += 1
+    flush()
+    return tokens
+
+
+def shell_command_segments(tokens: list[ShellToken]) -> list[list[ShellToken]]:
+    segments: list[list[ShellToken]] = []
+    current: list[ShellToken] = []
+    for token in tokens:
+        if token.operator and token.value in SHELL_COMMAND_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def normalized_shell_command(token: ShellToken) -> str:
+    return token.value.strip("&() ").casefold()
+
+
+def shell_redirection_targets(tokens: list[ShellToken]) -> list[ShellToken]:
+    targets: list[ShellToken] = []
+    conditional_depth = 0
+    for index, token in enumerate(tokens[:-1]):
+        if token.value in {"[[", "(("}:
+            conditional_depth += 1
+            continue
+        if token.value in {"]]", "))"}:
+            conditional_depth = max(0, conditional_depth - 1)
+            continue
+        if not token.operator or token.value not in {">", ">>"}:
+            continue
+        if conditional_depth:
+            continue
+        candidate = tokens[index + 1]
+        if candidate.value.startswith("&"):
+            continue
+        targets.append(candidate)
+    return targets
+
+
+def mutating_command_indexes(segment: list[ShellToken]) -> list[int]:
+    starts = [0]
+    starts.extend(index + 1 for index, token in enumerate(segment[:-1]) if token.value == "=")
+    indexes: list[int] = []
+    for start in starts:
+        while start < len(segment) and segment[start].value == "&":
+            start += 1
+        if start < len(segment) and normalized_shell_command(segment[start]) in {"command", "sudo"}:
+            start += 1
+        if (
+            start < len(segment)
+            and not segment[start].quoted
+            and normalized_shell_command(segment[start]) in SHELL_MUTATING_COMMANDS
+        ):
+            indexes.append(start)
+    return indexes
+
+
 def likely_mutating_shell(command: str) -> bool:
-    lowered = command.casefold()
-    read_only = (
-        "get-content",
-        "select-string",
-        "rg ",
-        "git status",
-        "git diff",
-        "p4 info",
-        "p4 where",
-        "p4 fstat",
-        "p4 diff",
-        "p4 opened",
-    )
-    if any(item in lowered for item in read_only) and not re.search(r"(?<![12])>(?!&)", command):
-        return False
-    mutating = (
-        "apply_patch",
-        "set-content",
-        "add-content",
-        "out-file",
-        "new-item",
-        "remove-item",
-        "move-item",
-        "copy-item",
-        "write_text",
-        "write_bytes",
-        "clang-format",
-        "prettier",
-        "sed -i",
-        "tee ",
-    )
-    return any(item in lowered for item in mutating) or bool(re.search(r"(?<![12])>(?!&)", command))
+    tokens = shell_tokens(command)
+    if shell_redirection_targets(tokens):
+        return True
+    return any(mutating_command_indexes(segment) for segment in shell_command_segments(tokens))
+
+
+def shell_argument_value(
+    tokens: list[ShellToken], index: int, variables: dict[str, str]
+) -> tuple[str | None, int]:
+    if index >= len(tokens):
+        return None, index
+    token = tokens[index]
+    cleaned = token.value.strip("(),")
+    if normalized_shell_command(token) == "join-path" and index + 2 < len(tokens):
+        base, base_end = shell_argument_value(tokens, index + 1, variables)
+        child, child_end = shell_argument_value(tokens, base_end + 1, variables)
+        if base is not None and child is not None:
+            return str(Path(base) / child), child_end
+        return None, child_end
+    if cleaned.startswith("$"):
+        return variables.get(cleaned.casefold()), index
+    if not cleaned or (token.quoted and "$" in cleaned):
+        return None, index
+    return cleaned, index
+
+
+def shell_variable_values(tokens: list[ShellToken]) -> dict[str, str]:
+    variables: dict[str, str] = {}
+    for segment in shell_command_segments(tokens):
+        if len(segment) < 3 or not segment[0].value.startswith("$") or segment[1].value != "=":
+            continue
+        resolved, _ = shell_argument_value(segment, 2, variables)
+        if resolved is not None:
+            variables[segment[0].value.casefold()] = resolved
+    return variables
+
+
+def named_shell_arguments(
+    segment: list[ShellToken], flags: set[str], variables: dict[str, str]
+) -> list[str]:
+    values: list[str] = []
+    index = 0
+    while index < len(segment) - 1:
+        if segment[index].value.casefold() in flags:
+            resolved, end = shell_argument_value(segment, index + 1, variables)
+            if resolved is not None:
+                values.append(resolved)
+            index = max(index + 1, end)
+        index += 1
+    return values
+
+
+def positional_shell_arguments(
+    segment: list[ShellToken], command_index: int, variables: dict[str, str]
+) -> list[str]:
+    values: list[str] = []
+    for token in segment[command_index + 1 :]:
+        if token.operator or token.value.startswith("-"):
+            continue
+        resolved, _ = shell_argument_value([token], 0, variables)
+        if resolved is not None:
+            values.append(resolved)
+    return values
+
+
+def mutating_segment_paths(
+    segment: list[ShellToken], variables: dict[str, str]
+) -> list[str]:
+    values: list[str] = []
+    for command_index in mutating_command_indexes(segment):
+        token = segment[command_index]
+        command = normalized_shell_command(token)
+        tail = segment[command_index + 1 :]
+        path_flags = {"-path", "-literalpath", "-filepath"}
+        destination_flags = {"-destination"}
+        if command in {"set-content", "add-content", "clear-content", "out-file"}:
+            values.extend(named_shell_arguments(tail, path_flags, variables))
+        elif command == "new-item":
+            item_types = named_shell_arguments(tail, {"-itemtype", "-type"}, variables)
+            if not item_types or item_types[-1].casefold() not in {
+                "directory",
+                "junction",
+                "symboliclink",
+            }:
+                values.extend(named_shell_arguments(tail, path_flags, variables))
+        elif command in {"remove-item"}:
+            values.extend(named_shell_arguments(tail, path_flags, variables))
+        elif command == "copy-item":
+            values.extend(named_shell_arguments(tail, destination_flags, variables))
+        elif command == "move-item":
+            values.extend(named_shell_arguments(tail, path_flags | destination_flags, variables))
+        elif command == "rename-item":
+            sources = named_shell_arguments(tail, path_flags, variables)
+            values.extend(sources)
+            new_names = named_shell_arguments(tail, {"-newname"}, variables)
+            if sources and new_names:
+                new_path = Path(new_names[-1])
+                values.append(
+                    str(new_path if new_path.is_absolute() else Path(sources[-1]).parent / new_path)
+                )
+        else:
+            positional = positional_shell_arguments(segment, command_index, variables)
+            if command in {"cp"} and positional:
+                values.append(positional[-1])
+            elif command in {"mv"}:
+                values.extend(positional)
+            elif command in {"rm", "touch", "tee"}:
+                values.extend(positional)
+            elif command == "sed" and "-i" in {item.value.casefold() for item in tail} and positional:
+                values.append(positional[-1])
+            elif command == "clang-format" and "-i" in {item.value.casefold() for item in tail}:
+                values.extend(positional)
+            elif command == "prettier" and "--write" in {item.value.casefold() for item in tail}:
+                values.extend(positional)
+    return values
 
 
 def extract_shell_paths(ctx: AuditContext, command: str, cwd: Path) -> list[Path]:
+    tokens = shell_tokens(command)
+    variables = shell_variable_values(tokens)
     values: list[str] = []
-    values.extend(match.group(1) for match in re.finditer(r"['\"]([^'\"]+)['\"]", command))
-    values.extend(
-        match.group(0)
-        for match in re.finditer(
-            r"(?:[A-Za-z]:[\\/][^\s'\"|;]+|(?:\.{0,2}[\\/])?[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_. @+()-]+)+)",
-            command,
-        )
-    )
+    for segment in shell_command_segments(tokens):
+        values.extend(mutating_segment_paths(segment, variables))
+    for token in shell_redirection_targets(tokens):
+        resolved, _ = shell_argument_value([token], 0, variables)
+        if resolved is not None:
+            values.append(resolved)
+
     paths: list[Path] = []
     for value in values:
         path = resolve_candidate_path(ctx, value, cwd)
@@ -553,40 +793,131 @@ def ownership_path(ctx: AuditContext) -> Path:
     return ctx.state_root / "ownership.json"
 
 
-def claim_paths(ctx: AuditContext, session: dict[str, Any], paths: list[Path]) -> None:
-    registry = read_json_if_exists(ownership_path(ctx), {"files": {}})
+def legacy_session_root(ctx: AuditContext, session_id: str) -> Path:
+    return ctx.state_root / "sessions" / bridge.sanitize_component(session_id, 80)
+
+
+def normalize_ownership_registry(
+    ctx: AuditContext, registry: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    if int(registry.get("schemaVersion") or 0) >= OWNERSHIP_SCHEMA_VERSION:
+        return registry, False
+    records = registry.setdefault("files", {})
+    for relative in list(records):
+        current = records.get(relative)
+        if not isinstance(current, dict):
+            del records[relative]
+            continue
+        session_id = str(current.get("sessionId") or "")
+        session_root = legacy_session_root(ctx, session_id)
+        legacy_session = read_json_if_exists(session_root / "session.json", {})
+        turn_id = str(legacy_session.get("activeTurnId") or "")
+        before = read_json_if_exists(session_root / "turns" / turn_id / "before.json", {"files": {}})
+        before_file = before.get("files", {}).get(relative)
+        project_file = ctx.project_root / Path(relative)
+        try:
+            project_file.resolve().relative_to(ctx.project_root.resolve())
+            inside_project = True
+        except (OSError, ValueError):
+            inside_project = False
+        material_path = inside_project and (
+            project_file.is_file()
+            or (isinstance(before_file, dict) and before_file.get("exists") is True)
+        )
+        if not turn_id or not material_path:
+            del records[relative]
+            continue
+        current["turnId"] = turn_id
+        current["source"] = "legacy-v5"
+    registry["schemaVersion"] = OWNERSHIP_SCHEMA_VERSION
+    registry["updatedAt"] = utc_now()
+    return registry, True
+
+
+def read_ownership_registry(ctx: AuditContext) -> tuple[dict[str, Any], bool]:
+    value = read_json_if_exists(ownership_path(ctx), {"files": {}})
+    if not isinstance(value, dict):
+        value = {"files": {}}
+    return normalize_ownership_registry(ctx, value)
+
+
+def refresh_owned_files(
+    session: dict[str, Any], records: dict[str, Any], session_id: str
+) -> None:
+    session["ownedFiles"] = sorted(
+        relative
+        for relative, current in records.items()
+        if isinstance(current, dict) and current.get("sessionId") == session_id
+    )
+
+
+def claim_paths(
+    ctx: AuditContext, session: dict[str, Any], turn_id: str, paths: list[Path]
+) -> None:
+    registry, _ = read_ownership_registry(ctx)
     records = registry.setdefault("files", {})
     now_epoch = time.time()
-    owned = set(str(item) for item in session.get("ownedFiles", []))
     for path in paths:
         relative = relative_path(ctx, path)
         current = records.get(relative)
-        if isinstance(current, dict) and current.get("sessionId") != ctx.session_id:
+        if isinstance(current, dict):
             age = now_epoch - float(current.get("updatedEpoch") or 0)
-            if age < LOCK_STALE_SECONDS:
+            current_session = current.get("sessionId")
+            current_turn = current.get("turnId")
+            if age < LOCK_STALE_SECONDS and current_session != ctx.session_id:
                 raise OwnershipConflict(
                     f"文件正由另一个 Codex 会话记录：{relative} "
-                    f"(session {current.get('sessionId')})"
+                    f"(session {current_session}, turn {current_turn or '-'})"
+                )
+            if (
+                age < LOCK_STALE_SECONDS
+                and current_session == ctx.session_id
+                and current_turn
+                and current_turn != turn_id
+            ):
+                raise OwnershipConflict(
+                    f"文件仍由本 Codex 会话的上一回合记录：{relative} "
+                    f"(turn {current_turn})"
                 )
         records[relative] = {
             "sessionId": ctx.session_id,
+            "turnId": turn_id,
             "branch": ctx.branch,
+            "source": "tool-hook",
             "updatedAt": utc_now(),
             "updatedEpoch": now_epoch,
         }
-        owned.add(relative)
-    session["ownedFiles"] = sorted(owned)
+    refresh_owned_files(session, records, ctx.session_id)
+    registry["schemaVersion"] = OWNERSHIP_SCHEMA_VERSION
     registry["updatedAt"] = utc_now()
     atomic_write_json(ownership_path(ctx), registry)
 
 
-def release_paths(ctx: AuditContext) -> None:
-    registry = read_json_if_exists(ownership_path(ctx), {"files": {}})
+def release_turn_paths(ctx: AuditContext, session: dict[str, Any], turn_id: str) -> None:
+    registry, _ = read_ownership_registry(ctx)
+    records = registry.setdefault("files", {})
+    for relative in list(records):
+        current = records.get(relative)
+        if (
+            isinstance(current, dict)
+            and current.get("sessionId") == ctx.session_id
+            and current.get("turnId") == turn_id
+        ):
+            del records[relative]
+    refresh_owned_files(session, records, ctx.session_id)
+    registry["updatedAt"] = utc_now()
+    atomic_write_json(ownership_path(ctx), registry)
+
+
+def release_paths(ctx: AuditContext, session: dict[str, Any] | None = None) -> None:
+    registry, _ = read_ownership_registry(ctx)
     records = registry.setdefault("files", {})
     for relative in list(records):
         current = records.get(relative)
         if isinstance(current, dict) and current.get("sessionId") == ctx.session_id:
             del records[relative]
+    if session is not None:
+        refresh_owned_files(session, records, ctx.session_id)
     registry["updatedAt"] = utc_now()
     atomic_write_json(ownership_path(ctx), registry)
 
@@ -967,7 +1298,7 @@ def prepare_tool(ctx: AuditContext, event: dict[str, Any]) -> int:
     with project_lock(ctx.state_root):
         session = load_session(ctx)
         turn_id = normalize_turn_id(ctx, event, session)
-        claim_paths(ctx, session, paths)
+        claim_paths(ctx, session, turn_id, paths)
         for path in paths:
             record_before_path(ctx, turn_id, path)
         save_session(ctx, session)
@@ -983,7 +1314,7 @@ def finish_tool(ctx: AuditContext, event: dict[str, Any]) -> int:
         turn_id = normalize_turn_id(ctx, event, session)
         manifest = read_json_if_exists(before_manifest_path(ctx, turn_id), {"files": {}})
         known = manifest.setdefault("files", {})
-        claim_paths(ctx, session, paths)
+        claim_paths(ctx, session, turn_id, paths)
         for path in paths:
             relative = relative_path(ctx, path)
             if relative not in known:
@@ -1009,6 +1340,8 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
         turn_id = normalize_turn_id(ctx, event, session)
         turn_state = session.setdefault("turns", {}).setdefault(turn_id, {})
         if turn_state.get("status") == "committed":
+            release_turn_paths(ctx, session, turn_id)
+            save_session(ctx, session)
             return {
                 "status": "already-committed",
                 "commit": turn_state.get("commit"),
@@ -1065,6 +1398,7 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
         if not changes:
             turn_state.update({"status": "no-changes", "finishedAt": utc_now()})
             session["activeTurnId"] = None
+            release_turn_paths(ctx, session, turn_id)
             save_session(ctx, session)
             return {"status": "no-changes", "branch": ctx.branch, "historyRoot": str(ctx.history_root)}
 
@@ -1093,6 +1427,7 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
         )
         session["nextSequence"] = int(session.get("nextSequence") or 1) + 1
         session["activeTurnId"] = None
+        release_turn_paths(ctx, session, turn_id)
         save_session(ctx, session)
         return {
             "status": "committed",
@@ -1108,10 +1443,13 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
 def mark_session(ctx: AuditContext, status: str) -> None:
     with project_lock(ctx.state_root):
         session = load_session(ctx)
+        registry, migrated = read_ownership_registry(ctx)
+        if migrated:
+            atomic_write_json(ownership_path(ctx), registry)
         session["status"] = status
         if status == "ended":
             session["endedAt"] = utc_now()
-            release_paths(ctx)
+            release_paths(ctx, session)
         save_session(ctx, session)
 
 

@@ -1,6 +1,6 @@
 # Codex P4 Diff
 
-[简体中文](README.zh-CN.md) | Current release: [v0.5.2](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.2)
+[简体中文](README.zh-CN.md) | Current release: [v0.5.3](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.3)
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
@@ -12,9 +12,9 @@ Codex P4 Diff records Codex changes as local Git history without modifying Perfo
 
 The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
-## What's new in v0.5.2
+## What's new in v0.5.3
 
-Commit titles now describe what Codex changed instead of echoing the user's last prompt or confirmation. The Stop hook takes the first meaningful completed-change line from `last_assistant_message`, skips generic Markdown lines such as "Done" or "Tests passed", redacts secrets, and falls back to a deterministic file-action title such as `修改 A.cpp` when needed. The original request remains available as `Request` in the commit body and `promptSummary` in the Git note. Existing commits are not rewritten.
+Shell auditing now distinguishes explicit write targets from ordinary quoted text. PowerShell values such as `$ErrorActionPreference = 'Stop'`, regex characters such as `>`, and directory/Junction creation no longer become fake project-file locks. Same-path ownership is scoped to the active turn and released after a successful commit or a no-change Stop. Failed finalization keeps ownership for safe retry, and the first updated task removes invalid legacy string records from local ownership state.
 
 ## Install
 
@@ -26,7 +26,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.2`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.3`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
@@ -35,6 +35,8 @@ Restart Codex, approve the plugin Hooks, open the P4 project, and create a new t
 At task start, the plugin initializes `<P4 ProjectRoot>/.git` and creates the fixed `codex/local-history` branch. It refuses to take over a pre-existing Git repository that does not contain its ownership marker under `.git/codex-p4-diff/project.json`. It never switches branches automatically.
 
 Every changed turn advances the shared branch by one `[Codex]` commit. Sessions are interleaved by turn completion time. A no-change turn creates no empty commit. The main Git index is updated only for paths recorded for that turn; the plugin never runs `git add -A`. If one of those paths already has staged content, the commit is refused. Staged content on unrelated paths is preserved.
+
+Shell commands participate in same-path protection only when the hook can identify a high-confidence file write target, such as `-LiteralPath`, `-Path`, `-Destination`, `-FilePath`, or an unquoted redirection target. Quoted messages, regex patterns, enum values, and directory/Junction targets are not claimed as files.
 
 The commit subject is `[Codex] <completed change>`. It is derived from the first meaningful line of the final assistant message after generic headings, status-only lines, Markdown markers, fenced code, and Codex directives are skipped. If no usable line exists, the plugin generates a title from file actions, for example `修改 A.cpp`, `新增 Config.ini`, or `更新 3 个文件：A.cpp、B.h 等`.
 
@@ -52,7 +54,7 @@ The note contains `changeSummary`, `changeSummarySource`, `assistantMessageSha25
 
 The runtime allows only `p4 info`, `where`, `fstat`, `diff`, `opened`, and `print`. It never creates, edits, reconciles, reopens, reverts, shelves, or submits a P4 changelist. P4 checkout and submission remain the responsibility of P4V, Unreal Source Control, or the user.
 
-Cross-session same-path conflicts use a local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or change P4 changelist ownership.
+Cross-session same-path conflicts use a turn-scoped local registry under `%LOCALAPPDATA%\CodexP4Diff\State`; they do not inspect or change P4 changelist ownership. Successful and no-change turns release their paths immediately. Failed or interrupted turns retain real-path ownership for retry, with a 24-hour stale fallback.
 
 ## Review and GitHub Desktop
 
@@ -80,7 +82,7 @@ $Runner = Join-Path $SkillRoot 'scripts\run_codex_p4_diff.ps1'
 
 Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, `branch`, and `legacyGitPointer`. `historyRoot` must equal the P4 project root and `branch` must be `codex/local-history`.
 
-Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Existing P4 changelists remain entirely user-managed.
+Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Version 0.5.3 also migrates local ownership state and drops non-path records produced by older shell parsing. Existing P4 changelists remain entirely user-managed.
 
 ## Update or remove
 
@@ -90,7 +92,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that the installed version is `0.5.2`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+Confirm that the installed version is `0.5.3`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins

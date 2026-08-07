@@ -168,6 +168,54 @@ class AuditHelpersTest(AuditTestCase):
         self.assertFalse(audit.likely_mutating_shell("Get-Content -LiteralPath a.txt"))
         self.assertFalse(audit.likely_mutating_shell("rg -n TODO Source"))
 
+    def test_quoted_regex_redirect_character_is_read_only(self) -> None:
+        command = (
+            "Get-Content -LiteralPath 'Book.xlsx'; "
+            "Select-String -Pattern '<c r=\"A4\"[^>]*>.*?</c>'"
+        )
+        self.assertFalse(audit.likely_mutating_shell(command))
+        self.assertFalse(audit.likely_mutating_shell("Write-Output Set-Content"))
+        self.assertFalse(audit.likely_mutating_shell("if [[ alpha > beta ]]; then echo ok; fi"))
+
+    def test_shell_paths_only_include_explicit_write_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            target = project / "Source" / "A.txt"
+            target.parent.mkdir(parents=True)
+            target.write_text("before\n", encoding="utf-8")
+            ctx = self.make_context(data_root / "local", project)
+            command = (
+                "$ErrorActionPreference = 'Stop'\n"
+                f"$projectRoot = '{project}'\n"
+                "$target = Join-Path $projectRoot 'Source/A.txt'\n"
+                "Set-Content -LiteralPath $target -Value 'Stop'"
+            )
+            paths = audit.extract_shell_paths(ctx, command, project)
+            self.assertEqual(paths, [target.resolve()])
+
+    def test_shell_junction_has_no_file_ownership_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            ctx = self.make_context(data_root / "local", project)
+            command = (
+                "$junction = Join-Path 'Saved/Codex' 'node_modules'\n"
+                "New-Item -ItemType Junction -Path $junction -Target 'C:/dependencies/node_modules'"
+            )
+            self.assertTrue(audit.likely_mutating_shell(command))
+            self.assertEqual(audit.extract_shell_paths(ctx, command, project), [])
+
+    def test_shell_redirection_records_only_its_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            ctx = self.make_context(data_root / "local", project)
+            paths = audit.extract_shell_paths(ctx, "'hello > text' > 'Output/result.txt'", project)
+            self.assertEqual(paths, [(project / "Output" / "result.txt").resolve()])
+
 
 class TurnCommitIntegrationTest(AuditTestCase):
     def test_two_changed_turns_create_two_commits_on_fixed_branch(self) -> None:
@@ -503,6 +551,112 @@ class LocalOwnershipTest(AuditTestCase):
             self.assertEqual(audit.prepare_tool(first, event), 1)
             with self.assertRaisesRegex(audit.OwnershipConflict, "另一个 Codex 会话"):
                 audit.prepare_tool(second, event)
+
+    def test_successful_turn_releases_path_for_another_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("before\n", encoding="utf-8")
+            first = self.make_context(data_root / "local", project, "session-one")
+            second = self.make_context(data_root / "local", project, "session-two")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(target)},
+            }
+
+            self.start_turn(first, "turn-1")
+            self.assertEqual(audit.prepare_tool(first, event), 1)
+            target.write_text("after\n", encoding="utf-8")
+            self.assertEqual(self.finalize(first, "turn-1")["status"], "committed")
+
+            self.start_turn(second, "turn-2")
+            self.assertEqual(audit.prepare_tool(second, event), 1)
+
+    def test_no_change_turn_releases_path_for_another_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("same\n", encoding="utf-8")
+            first = self.make_context(data_root / "local", project, "session-one")
+            second = self.make_context(data_root / "local", project, "session-two")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(target)},
+            }
+
+            self.start_turn(first, "turn-1")
+            self.assertEqual(audit.prepare_tool(first, event), 1)
+            self.assertEqual(self.finalize(first, "turn-1")["status"], "no-changes")
+
+            self.start_turn(second, "turn-2")
+            self.assertEqual(audit.prepare_tool(second, event), 1)
+
+    def test_failed_turn_keeps_path_for_safe_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("staged\n", encoding="utf-8")
+            first = self.make_context(data_root / "local", project, "session-one")
+            second = self.make_context(data_root / "local", project, "session-two")
+            subprocess.run([first.git_exe, "-C", str(project), "add", "-f", "--", "A.txt"], check=True)
+            event = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(target)},
+            }
+
+            self.start_turn(first, "turn-1")
+            self.assertEqual(audit.prepare_tool(first, event), 1)
+            target.write_text("after\n", encoding="utf-8")
+            with self.assertRaisesRegex(audit.AuditError, "已暂存"):
+                self.finalize(first, "turn-1")
+
+            self.start_turn(second, "turn-2")
+            with self.assertRaisesRegex(audit.OwnershipConflict, "另一个 Codex 会话"):
+                audit.prepare_tool(second, event)
+
+    def test_legacy_non_path_ownership_is_removed_during_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace" / "Project"
+            project.mkdir(parents=True)
+            target = project / "A.txt"
+            target.write_text("content\n", encoding="utf-8")
+            legacy = self.make_context(data_root / "local", project, "legacy-session")
+            current = self.make_context(data_root / "local", project, "current-session")
+            self.start_turn(legacy, "legacy-turn")
+            audit.record_before_path(legacy, "legacy-turn", project / "Stop")
+            audit.atomic_write_json(
+                audit.ownership_path(legacy),
+                {
+                    "files": {
+                        "Stop": {
+                            "sessionId": legacy.session_id,
+                            "updatedAt": audit.utc_now(),
+                            "updatedEpoch": audit.time.time(),
+                        }
+                    }
+                },
+            )
+
+            self.start_turn(current, "current-turn")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(target)},
+            }
+            self.assertEqual(audit.prepare_tool(current, event), 1)
+            registry = json.loads(audit.ownership_path(current).read_text(encoding="utf-8"))
+            self.assertEqual(registry["schemaVersion"], audit.OWNERSHIP_SCHEMA_VERSION)
+            self.assertNotIn("Stop", registry["files"])
 
 
 if __name__ == "__main__":

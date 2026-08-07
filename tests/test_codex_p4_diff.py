@@ -266,7 +266,7 @@ class DistributionTests(unittest.TestCase):
         )
         entry = marketplace["plugins"][0]
         self.assertEqual(manifest["name"], "codex-p4-diff")
-        self.assertEqual(manifest["version"], "0.5.2")
+        self.assertEqual(manifest["version"], "0.5.3")
         self.assertEqual(manifest["author"]["name"], "BillyCSZhao")
         self.assertEqual(manifest["repository"], "https://github.com/BillyCSZhao/codex-p4-diff")
         self.assertEqual(entry["name"], manifest["name"])

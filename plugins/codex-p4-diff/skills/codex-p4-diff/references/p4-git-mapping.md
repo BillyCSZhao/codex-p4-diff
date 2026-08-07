@@ -11,7 +11,7 @@
    └─ refs/notes/codex-p4-diff      # 每条 commit 的完整回合收据
 
 %LOCALAPPDATA%/CodexP4Diff/State/<project-name-hash>/
-├─ ownership.json                   # 跨会话同路径所有权
+├─ ownership.json                   # 跨会话、回合级同路径所有权
 └─ sessions/<session-id>/
    ├─ session.json
    └─ turns/<turn-id>/              # commit 前快照和重试状态
@@ -32,6 +32,8 @@ codex/local-history
 ~~~
 
 project lock 序列化读取 HEAD、生成 commit、更新 notes/index/ref 的流程。commit 标题优先来自助手最终回复中的实际完成内容，无法提取时按文件动作生成；原始用户请求保留在正文和 note 中。commit message 和 note 都包含 session/turn，因此无需分支隔离也能追溯归属。
+
+路径所有权只覆盖正在执行的回合。成功 commit 或无变化 Stop 后立即释放；提交失败时保留以便重试，异常中断仍使用 24 小时过期兜底。它与只持续几十秒的 `.project.lock` 不同，后者只负责串行更新 Git 和状态文件。
 
 ## 精确路径与漂移
 
@@ -61,7 +63,7 @@ git notes --ref=codex-p4-diff show <commit>
 
 ## 迁移
 
-0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。升级后的标题规则只影响新任务创建的新 commit，不改写已有历史。
+0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。0.5.3 首次启动会迁移 `ownership.json`，删除旧 shell 解析器产生的非路径记录，同时保留活跃回合中的真实文件记录。升级后的标题规则只影响新任务创建的新 commit，不改写已有历史。
 
 ## 常见问题
 
@@ -83,11 +85,11 @@ Stop hook 已把本回合改动提交后，`Unstaged` 为空是正常的。切�
 
 ### shell 修改没有精确补丁
 
-优先使用 `apply_patch`、`Edit`、`Write`，或传入明确文件路径。执行后才发现的路径只记录收据，不能伪造写入前快照。
+优先使用 `apply_patch`、`Edit`、`Write`，或在 shell 中使用 `-LiteralPath`、`-Path`、`-Destination`、`-FilePath` 和明确重定向目标。复杂脚本无法高置信识别目标时不会猜测或阻断；执行后才发现的路径只记录收据，不能伪造写入前快照。
 
 ### 同一路径被另一个会话锁定
 
-结束原任务以触发 `SessionEnd`。异常退出的所有权记录 24 小时后过期。不要通过 P4 reopen 解决。
+先确认提示的是同一真实文件而不是目录或普通字符串。正常 commit 或无变化 Stop 会立即释放路径；提交失败时修复原因并重试 Stop，异常退出的所有权记录 24 小时后过期。不要通过 P4 reopen 解决。
 
 ### commit 失败
 

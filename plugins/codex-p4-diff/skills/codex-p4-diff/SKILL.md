@@ -1,6 +1,6 @@
 ---
 name: codex-p4-diff
-description: 在 P4 工程根的固定本地 Git 分支中记录所有 Codex 会话，并在每个有文件变化的用户回合结束时自动创建一个本地 Git commit；记录实际改动摘要、原始需求、会话、回合、文件动作、前后哈希和文本补丁，同时保证 Perforce 仅被只读查询。适用于在 Codex Review 或 GitHub Desktop 追溯不同 Codex 会话和回合的修改、诊断自动提交、迁移旧版 P4 CL/外置历史模式，或核对插件是否完全不写入 P4。
+description: 在 P4 工程根的固定本地 Git 分支中记录所有 Codex 会话，并在每个有文件变化的用户回合结束时自动创建一个本地 Git commit；记录实际改动摘要、原始需求、会话、回合、文件动作、前后哈希和文本补丁，同时保证 Perforce 仅被只读查询。适用于在 Codex Review 或 GitHub Desktop 追溯不同 Codex 会话和回合的修改、诊断自动提交或路径锁、迁移旧版 P4 CL/外置历史模式，或核对插件是否完全不写入 P4。
 ---
 
 # Codex P4 Diff
@@ -20,18 +20,18 @@ description: 在 P4 工程根的固定本地 Git 分支中记录所有 Codex 会
 
 不要通过插件调用 `change`、`edit`、`add`、`delete`、`reconcile`、`reopen`、`revert`、`shelve` 或 `submit`。P4 checkout、变更列表归属和提交继续由用户、P4V、Unreal Source Control 或项目工具负责。
 
-跨会话同路径冲突只使用 `%LOCALAPPDATA%\CodexP4Diff\State` 的本地所有权记录判断，不读取或修改 P4 changelist 归属。另一个活跃 Codex 会话已记录同一路径时，停止写入并报告 session ID。
+跨会话同路径冲突只使用 `%LOCALAPPDATA%\CodexP4Diff\State` 的本地所有权记录判断，不读取或修改 P4 changelist 归属。只有另一个活跃回合已认领同一真实文件时才停止写入，并报告 session/turn ID；普通 shell 字符串、正则以及目录目标不得成为文件所有权记录。
 
 ## 自动生命周期
 
 1. `SessionStart` 验证 P4 映射，在项目根安全初始化或验证插件拥有的 `.git`，检查固定分支、无 remote 和 push 阻断，并建立会话账本。
 2. `UserPromptSubmit` 创建回合记录，保存脱敏摘要和 prompt SHA-256。
-3. `PreToolUse` 在 `apply_patch`、`Edit`、`Write` 或明确写入型 shell 工具执行前保存目标文件状态并取得本地会话所有权。
+3. `PreToolUse` 在 `apply_patch`、`Edit`、`Write` 或明确写入型 shell 工具执行前保存目标文件状态并取得本地回合所有权。shell 只认高置信写入参数和引号外重定向目标。
 4. `PostToolUse` 补记执行后才暴露的路径；明确标记写入前内容不可用，不冒充精确差异。
-5. `Stop` 比较前后状态，从 `last_assistant_message` 提取实际改动摘要，在全局固定分支串行创建一个 commit，并仅同步本回合路径的 index。空泛总结会被跳过；无可用总结时按文件动作生成标题。目标路径已有 staged 内容时停止；不相关 staged 内容保持不变。
-6. `SessionEnd` 结束本地账本并释放本地路径所有权，不执行 P4 写操作。
+5. `Stop` 比较前后状态，从 `last_assistant_message` 提取实际改动摘要，在全局固定分支串行创建一个 commit，并仅同步本回合路径的 index。空泛总结会被跳过；无可用总结时按文件动作生成标题。目标路径已有 staged 内容时停止；不相关 staged 内容保持不变。成功 commit 或无变化时立即释放本回合所有权；收尾失败时保留以便重试。
+6. `SessionEnd` 结束本地账本并释放该会话仍保留的异常所有权，不执行 P4 写操作。
 
-Hooks 只覆盖经过通用 Tool Hooks 的写入。专用工具绕过 Hook 时，不要声称记录了精确写入前内容；明确报告覆盖缺口。
+Hooks 只覆盖经过通用 Tool Hooks 的写入。复杂 shell 或专用工具无法高置信识别目标路径时，以不中断正常命令为优先，不得猜测路径；不要声称记录了精确写入前内容，并明确报告覆盖缺口。
 
 ## 诊断
 
