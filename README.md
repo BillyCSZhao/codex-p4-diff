@@ -1,6 +1,6 @@
 # Codex P4 Diff
 
-[简体中文](README.zh-CN.md) | Current release: [v0.5.4](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.4)
+[简体中文](README.zh-CN.md) | Current release: [v0.5.5](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.5)
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
@@ -12,11 +12,11 @@ Codex P4 Diff records Codex changes as local Git history without modifying Perfo
 
 The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
-## What's new in v0.5.4
+## What's new in v0.5.5
 
-Project commit serialization now uses bounded operating-system file locks instead of deleting lock files by age. Same-path ownership uses schema 8 renewable short leases plus random registry epochs and per-claim tokens, so a deleted or rebuilt registry cannot reuse an older turn's token. Git finalization is journaled as an idempotent transaction: interrupted ref, note, and index updates resume without duplicating a turn commit. Project-level recovery markers let a later session finish an earlier session's deferred turn, while terminal state is merged under the short shared-state lock so recovery cannot overwrite a concurrently created prompt or claim.
+An existing plugin-owned history now keeps its P4 identity stable. The client and server recorded in `.git/codex-p4-diff/project.json` are reused and revalidated before ambient environment or P4V discovery, so an unrelated default `P4CLIENT` or two P4V workspaces that map the same directory cannot silently redirect the history or its state.
 
-Pre-existing same-path staged content is preserved as `staged-receipt-only` instead of rejecting the turn. When Stop defers before creating a transaction, a turn-scoped lock makes the first frozen after snapshot immutable; the plugin releases the old claim only after that snapshot's ownership attribution is sealed. If another handler is still publishing the snapshot, the claim remains until sealing succeeds. If the after snapshot cannot be frozen, recovery creates a partial `deferred-after-unavailable-receipt-only` and never reads later worktree content into the old turn. Shell auditing expands statically resolvable command chains, call operators, directory destinations, and globs. Dynamic or unresolved writes are explicitly recorded as `partial` coverage warnings and surfaced to the task without blocking the command. Ordinary audit errors also fail open; only a confirmed live same-path ownership conflict denies a write. Perforce remains read-only throughout.
+A task started below an existing owned project resolves to the nearest parent history root. The search stops at a closer foreign `.git` boundary and never traverses or takes it over. A recognized plugin-owned legacy pointer becomes that directory's project boundary and retains the existing serialized migration behavior. On first setup, when no owned marker exists and multiple P4 clients map the same directory, Hooks now surface an actionable fail-open warning instead of silently skipping the task; normal tool operations continue. Ordinary unmapped directories remain out of scope. The P4 runtime whitelist is unchanged and read-only.
 
 ## Install
 
@@ -28,13 +28,13 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.4`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.5`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
 ## Behavior
 
-At task start, the plugin initializes `<P4 ProjectRoot>/.git` and creates the fixed `codex/local-history` branch. Legacy `.git` pointer migration and repository initialization are serialized by `.repo-setup.lock`. The plugin refuses to take over a pre-existing Git repository that does not contain its ownership marker under `.git/codex-p4-diff/project.json`, and it never switches branches automatically.
+At task start, the plugin searches from the task directory upward for the nearest `.git/codex-p4-diff/project.json` that identifies an owned history. Its recorded project root, P4 client, and server are treated as the established identity and revalidated with read-only P4 queries. A task started in a subdirectory therefore reuses the parent history and state. The upward search stops at the first closer foreign repository or unknown `.git` pointer and does not cross that boundary. A recognized plugin-owned legacy pointer instead identifies that directory as the project root and can be migrated under the existing serialized rules. For first setup, start the task at the intended P4 project root. Legacy pointer migration and repository initialization are serialized by `.repo-setup.lock`. The plugin refuses to take over a pre-existing foreign Git repository and never switches branches automatically.
 
 Every changed turn advances the shared branch by one `[Codex]` commit. Sessions are interleaved by turn completion time. A no-change turn creates no empty commit. The main Git index is updated only for paths recorded for that turn; the plugin never runs `git add -A`. Pre-existing staged content on a recorded path is left untouched and represented as `staged-receipt-only`, while other eligible paths may still enter the commit. Unrelated staged content is also preserved. Final comparison and replacement use Git's standard `index.lock`: updates are built in a temporary index and atomically installed, so a stage that wins before the lock is skipped and no stage can appear between comparison and replacement.
 
@@ -88,9 +88,11 @@ $Runner = Join-Path $SkillRoot 'scripts\run_codex_p4_diff.ps1'
   --doctor
 ```
 
-Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, `branch`, and `legacyGitPointer`. `historyRoot` must equal the P4 project root and `branch` must be `codex/local-history`.
+Check `ready`, `p4Mode`, `p4Writes`, `historyRoot`, `branch`, and `legacyGitPointer`. `historyRoot` must equal the owned P4 project root and `branch` must be `codex/local-history`; when the command starts in a nested directory, `historyRoot` may therefore be a parent directory.
 
-Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Version 0.5.3 dropped non-path ownership records produced by older shell parsing. Version 0.5.4 migrates ownership to schema 8, retaining only active before-manifest paths and replacing historical counters with bounded epoch-scoped claim tokens. Existing P4 changelists remain entirely user-managed.
+Version 0.3 could create a P4 pending changelist and attach a plugin-owned `.git` pointer. Version 0.4 moved history outside the project. Version 0.5 performs no P4 migration and leaves old external history untouched; it only removes a legacy `.git` file when it points into known plugin-owned local-data directories. Version 0.5.3 dropped non-path ownership records produced by older shell parsing. Version 0.5.4 migrates ownership to schema 8, retaining only active before-manifest paths and replacing historical counters with bounded epoch-scoped claim tokens. Version 0.5.5 reuses the validated P4 identity from an existing owned marker and makes first-time client ambiguity visible. Existing P4 changelists remain entirely user-managed.
+
+If first-time discovery finds more than one mapped P4 client, run Doctor with explicit `--port` and `--client` from the intended project root. Hooks report the ambiguity as a fail-open warning and do not block normal tool operations. If an existing owned marker can no longer be validated, repair the P4 login or mapping rather than deleting the marker or allowing the history to drift to another client.
 
 ## Update or remove
 
@@ -100,7 +102,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that the installed version is `0.5.4`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+Confirm that the installed version is `0.5.5`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins

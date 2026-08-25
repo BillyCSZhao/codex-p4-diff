@@ -61,6 +61,8 @@ class AuditTestCase(unittest.TestCase):
     ) -> audit.AuditContext:
         p4_context = {
             "p4Exe": "p4",
+            "p4Port": "p4.example.test:1666",
+            "p4User": "tester",
             "serverAddress": "p4.example.test:1666",
             "userName": "tester",
             "client": "test-client",
@@ -442,6 +444,773 @@ class AuditHelpersTest(AuditTestCase):
                 )
             self.assertEqual(len(limited.paths), 2)
             self.assertIn("shell-path-limit", limited.warnings)
+
+
+class ContextResolutionTest(AuditTestCase):
+    @staticmethod
+    def fake_p4_tagged(
+        project: Path,
+        mapped_clients: set[str],
+        server: str = "p4.example.test:1666",
+    ):
+        def run(
+            _p4_exe: str,
+            args,
+            *,
+            cwd: Path,
+            client: str | None = None,
+            port: str | None = None,
+            user: str | None = None,
+            check: bool = True,
+        ) -> list[dict[str, str]]:
+            del check
+            command = list(args)[0]
+            selected_client = client or os.environ.get("P4CLIENT")
+            if command == "info":
+                if not selected_client:
+                    return []
+                return [
+                    {
+                        "clientName": selected_client,
+                        "clientRoot": str(project.parent),
+                        "serverAddress": port or server,
+                        "userName": user or "tester",
+                    }
+                ]
+            if command == "where" and selected_client in mapped_clients:
+                return [
+                    {
+                        "path": str(cwd),
+                        "depotFile": "//depot/workspace/...",
+                    }
+                ]
+            return []
+
+        return run
+
+    @staticmethod
+    def run_hook(event: dict[str, object]) -> tuple[int, str]:
+        payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        stdin = io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), mock.patch.object(
+            sys, "stdout", stdout
+        ):
+            result = audit.hook_main()
+        return result, stdout.getvalue()
+
+    def test_existing_marker_disambiguates_wrong_environment_and_two_p4v_clients(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            marker = project / ".git" / bridge.TOOL_NAME / "project.json"
+            marker_before = marker.read_bytes()
+            candidates = [
+                {
+                    "port": "p4.example.test:1666",
+                    "user": "tester",
+                    "client": "test-client",
+                },
+                {
+                    "port": "p4.example.test:1666",
+                    "user": "tester",
+                    "client": "duplicate-client",
+                },
+            ]
+            resolve_executable = bridge.resolve_executable
+
+            def resolve_test_executable(
+                configured: str | None, name: str, install_hint: str
+            ) -> str:
+                if name == "p4":
+                    return "p4"
+                return resolve_executable(configured, name, install_hint)
+
+            with (
+                mock.patch.dict(os.environ, {"P4CLIENT": "wrong-environment-client"}),
+                mock.patch.object(bridge, "user_data_root", return_value=data_root / "local"),
+                mock.patch.object(
+                    bridge,
+                    "resolve_executable",
+                    side_effect=resolve_test_executable,
+                ),
+                mock.patch.object(
+                    bridge,
+                    "p4_tagged",
+                    side_effect=self.fake_p4_tagged(
+                        project, {"test-client", "duplicate-client"}
+                    ),
+                ) as tagged,
+                mock.patch.object(
+                    bridge, "load_p4v_candidates", return_value=candidates
+                ) as load_candidates,
+            ):
+                resolved = audit.resolve_context(
+                    {
+                        "cwd": str(project),
+                        "session_id": "marker-priority-session",
+                    }
+                )
+
+            self.assertEqual(resolved.project_root, project)
+            self.assertEqual(resolved.history_root, original.history_root)
+            self.assertEqual(resolved.state_root, original.state_root)
+            self.assertEqual(resolved.p4["client"], "test-client")
+            self.assertEqual(resolved.p4["source"], "owned-history-marker")
+            self.assertEqual(marker.read_bytes(), marker_before)
+            load_candidates.assert_not_called()
+            self.assertTrue(
+                any(
+                    call.kwargs.get("client") == "test-client"
+                    and list(call.args[1])[0] == "where"
+                    for call in tagged.call_args_list
+                ),
+                "the marker client must still be validated through p4 where",
+            )
+
+    def test_legacy_marker_without_p4port_uses_validated_environment_or_p4v_endpoint(
+        self,
+    ) -> None:
+        endpoint_cases = [
+            ("environment", "p4-environment-broker.example.test:1666", False),
+            ("p4v", "p4-p4v-broker.example.test:1666", True),
+        ]
+        for name, endpoint, expect_p4v in endpoint_cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                data_root = Path(temp).resolve()
+                project = data_root / "workspace"
+                project.mkdir(parents=True)
+                original = self.make_context(data_root / "local", project)
+                marker_path = project / ".git" / bridge.TOOL_NAME / "project.json"
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                marker.pop("p4Port", None)
+                marker.pop("p4User", None)
+                audit.atomic_write_json(marker_path, marker)
+                marker_before = marker_path.read_bytes()
+
+                def discover(
+                    _project_root: Path,
+                    *,
+                    p4_exe: str | None = None,
+                    client: str | None = None,
+                    port: str | None = None,
+                    user: str | None = None,
+                    connection_map: Path | None = None,
+                ) -> dict[str, object]:
+                    del p4_exe, user, connection_map
+                    if client != "test-client":
+                        raise bridge.CodexP4DiffError("unexpected client")
+                    if name == "environment" and port is None:
+                        return {**original.p4, "p4Port": endpoint}
+                    if name == "p4v" and port == endpoint:
+                        return {**original.p4, "p4Port": endpoint}
+                    raise bridge.CodexP4DiffError(
+                        f"test endpoint is unavailable: {port or '<environment>'}"
+                    )
+
+                candidates = [
+                    {
+                        "port": "p4-other.example.test:1666",
+                        "user": "tester",
+                        "client": "other-client",
+                    },
+                    {
+                        "port": endpoint,
+                        "user": "tester",
+                        "client": "test-client",
+                        "connectionMap": "test-connection-map.xml",
+                    },
+                ]
+                with (
+                    mock.patch.object(
+                        bridge, "user_data_root", return_value=data_root / "local"
+                    ),
+                    mock.patch.object(
+                        bridge, "discover_p4_context", side_effect=discover
+                    ) as discover_context,
+                    mock.patch.object(
+                        bridge, "load_p4v_candidates", return_value=candidates
+                    ) as load_candidates,
+                ):
+                    resolved = audit.resolve_context(
+                        {
+                            "cwd": str(project),
+                            "session_id": f"legacy-marker-{name}",
+                        }
+                    )
+
+                self.assertEqual(resolved.project_root, project)
+                self.assertEqual(resolved.p4["client"], "test-client")
+                self.assertEqual(
+                    resolved.p4["serverAddress"], "p4.example.test:1666"
+                )
+                self.assertEqual(resolved.p4["p4Port"], endpoint)
+                self.assertEqual(resolved.p4["source"], "owned-history-marker")
+                self.assertEqual(marker_path.read_bytes(), marker_before)
+                self.assertEqual(load_candidates.called, expect_p4v)
+                if expect_p4v:
+                    self.assertEqual(
+                        resolved.p4["connectionMap"], "test-connection-map.xml"
+                    )
+                attempted_ports = [
+                    call.kwargs.get("port")
+                    for call in discover_context.call_args_list
+                ]
+                self.assertEqual(attempted_ports[0], None)
+                if expect_p4v:
+                    self.assertIn(endpoint, attempted_ports)
+
+    def test_legacy_marker_without_p4port_accepts_explicit_broker_alias(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            marker_path = project / ".git" / bridge.TOOL_NAME / "project.json"
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker.pop("p4Port", None)
+            marker.pop("p4User", None)
+            audit.atomic_write_json(marker_path, marker)
+            marker_before = marker_path.read_bytes()
+            broker = "p4-broker-alias.example.test:1666"
+            discovered = {**original.p4, "p4Port": broker}
+
+            with mock.patch.object(
+                bridge, "discover_p4_context", return_value=discovered
+            ) as discover:
+                resolved_root, resolved = bridge.resolve_project_p4_context(
+                    project,
+                    port=broker,
+                )
+
+            self.assertEqual(resolved_root, project)
+            self.assertEqual(resolved["client"], "test-client")
+            self.assertEqual(resolved["p4Port"], broker)
+            self.assertEqual(resolved["serverAddress"], "p4.example.test:1666")
+            self.assertEqual(resolved["source"], "owned-history-marker")
+            self.assertEqual(discover.call_args.kwargs["client"], "test-client")
+            self.assertEqual(discover.call_args.kwargs["port"], broker)
+            self.assertEqual(marker_path.read_bytes(), marker_before)
+
+    def test_legacy_marker_without_p4port_rejects_server_identity_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            marker_path = project / ".git" / bridge.TOOL_NAME / "project.json"
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker.pop("p4Port", None)
+            marker.pop("p4User", None)
+            audit.atomic_write_json(marker_path, marker)
+            marker_before = marker_path.read_bytes()
+
+            mismatched = {
+                **original.p4,
+                "serverAddress": "other-p4.example.test:1666",
+            }
+            with (
+                mock.patch.object(
+                    bridge, "user_data_root", return_value=data_root / "local"
+                ),
+                mock.patch.object(
+                    bridge, "discover_p4_context", return_value=mismatched
+                ),
+                mock.patch.object(
+                    bridge,
+                    "load_p4v_candidates",
+                    return_value=[
+                        {
+                            "port": "p4-broker.example.test:1666",
+                            "user": "tester",
+                            "client": "test-client",
+                        }
+                    ],
+                ),
+            ):
+                result, output = self.run_hook(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "cwd": str(project),
+                        "session_id": "legacy-marker-server-mismatch",
+                    }
+                )
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output)
+            response = json.loads(output)
+            hook_output = response["hookSpecificOutput"]
+            self.assertIn("codex-p4-diff", hook_output["additionalContext"])
+            self.assertIn("other-p4.example.test:1666", hook_output["additionalContext"])
+            self.assertIn("p4.example.test:1666", hook_output["additionalContext"])
+            self.assertNotIn("permissionDecision", hook_output)
+            self.assertEqual(marker_path.read_bytes(), marker_before)
+            session_file = (
+                original.state_root
+                / "sessions"
+                / "legacy-marker-server-mismatch"
+                / "session.json"
+            )
+            self.assertFalse(session_file.exists())
+
+    def test_nested_cwd_reuses_owned_project_root_and_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            nested = project / "Project" / "Source" / "Feature"
+            nested.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            discovered = dict(original.p4)
+            wrong_state: Path
+
+            with (
+                mock.patch.object(bridge, "user_data_root", return_value=data_root / "local"),
+                mock.patch.object(
+                    bridge, "discover_p4_context", return_value=discovered
+                ) as discover,
+            ):
+                response = audit.handle_event(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "cwd": str(nested),
+                        "session_id": "nested-session",
+                    }
+                )
+                wrong_state = bridge.storage_paths(discovered, nested)["state"]
+
+            discover.assert_called_once()
+            self.assertEqual(discover.call_args.args[0], project)
+            self.assertEqual(discover.call_args.kwargs["client"], "test-client")
+            self.assertEqual(
+                discover.call_args.kwargs["port"], "p4.example.test:1666"
+            )
+            self.assertIn(
+                str(project), response["hookSpecificOutput"]["additionalContext"]
+            )
+            session_file = (
+                original.state_root
+                / "sessions"
+                / bridge.sanitize_component("nested-session", 80)
+                / "session.json"
+            )
+            self.assertTrue(session_file.is_file())
+            session = json.loads(session_file.read_text(encoding="utf-8"))
+            self.assertEqual(Path(session["projectRoot"]), project)
+            self.assertEqual(Path(session["historyRoot"]), project)
+            self.assertEqual(session["client"], "test-client")
+            self.assertFalse((nested / ".git").exists())
+            self.assertFalse(wrong_state.exists())
+
+    def test_first_use_ambiguous_clients_is_visible_but_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            candidates = [
+                {
+                    "port": "p4.example.test:1666",
+                    "user": "tester",
+                    "client": "client-a",
+                },
+                {
+                    "port": "p4.example.test:1666",
+                    "user": "tester",
+                    "client": "client-b",
+                },
+            ]
+
+            with (
+                mock.patch.dict(os.environ, {"P4CLIENT": "wrong-environment-client"}),
+                mock.patch.object(bridge, "user_data_root", return_value=data_root / "local"),
+                mock.patch.object(bridge, "resolve_executable", return_value="p4"),
+                mock.patch.object(
+                    bridge,
+                    "p4_tagged",
+                    side_effect=self.fake_p4_tagged(project, {"client-a", "client-b"}),
+                ),
+                mock.patch.object(
+                    bridge, "load_p4v_candidates", return_value=candidates
+                ),
+            ):
+                result, output = self.run_hook(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "cwd": str(project),
+                        "session_id": "ambiguous-session",
+                    }
+                )
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output)
+            response = json.loads(output)
+            hook_output = response["hookSpecificOutput"]
+            message = hook_output["additionalContext"]
+            self.assertIn("codex-p4-diff", message)
+            self.assertIn("多个 P4V", message)
+            self.assertIn("client-a", message)
+            self.assertIn("client-b", message)
+            self.assertNotIn("permissionDecision", hook_output)
+            self.assertFalse((project / ".git").exists())
+
+    def test_ordinary_non_p4_workspace_remains_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+
+            with (
+                mock.patch.dict(os.environ, {"P4CLIENT": "unmapped-client"}),
+                mock.patch.object(bridge, "user_data_root", return_value=data_root / "local"),
+                mock.patch.object(bridge, "resolve_executable", return_value="p4"),
+                mock.patch.object(
+                    bridge,
+                    "p4_tagged",
+                    side_effect=self.fake_p4_tagged(project, set()),
+                ),
+                mock.patch.object(bridge, "load_p4v_candidates", return_value=[]),
+            ):
+                result, output = self.run_hook(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "cwd": str(project),
+                        "session_id": "non-p4-session",
+                    }
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output, "")
+            self.assertFalse((project / ".git").exists())
+
+    def test_nested_cwd_does_not_cross_foreign_git_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            outer = self.make_context(data_root / "local", project)
+            marker = project / ".git" / bridge.TOOL_NAME / "project.json"
+            marker_before = marker.read_bytes()
+            foreign = project / "ForeignRepo"
+            nested = foreign / "Source"
+            nested.mkdir(parents=True)
+            (foreign / ".git").mkdir()
+
+            with mock.patch.object(
+                bridge,
+                "discover_p4_context",
+                side_effect=bridge.CodexP4DiffError("no P4 mapping"),
+            ) as discover:
+                with self.assertRaisesRegex(
+                    audit.HookSkip, "不会继续向外查找"
+                ):
+                    audit.resolve_context(
+                        {
+                            "cwd": str(nested),
+                            "session_id": "foreign-boundary-session",
+                        }
+                    )
+
+            discover.assert_not_called()
+            self.assertEqual(marker.read_bytes(), marker_before)
+            outer_session = (
+                outer.state_root
+                / "sessions"
+                / bridge.sanitize_component("foreign-boundary-session", 80)
+                / "session.json"
+            )
+            self.assertFalse(outer_session.exists())
+            self.assertTrue((foreign / ".git").is_dir())
+            self.assertFalse((nested / ".git").exists())
+
+    def test_owned_history_rejects_client_and_server_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            marker = project / ".git" / bridge.TOOL_NAME / "project.json"
+            marker_before = marker.read_bytes()
+            head_before = bridge.git_output(
+                original.git_exe, project, ["rev-parse", "HEAD"]
+            )
+            drift_cases = [
+                (
+                    "client",
+                    {**original.p4, "client": "other-client"},
+                    "已绑定 P4 client",
+                ),
+                (
+                    "server",
+                    {
+                        **original.p4,
+                        "serverAddress": "other-p4.example.test:1666",
+                        "p4Port": "other-p4.example.test:1666",
+                    },
+                    "已绑定 P4 server",
+                ),
+            ]
+
+            with mock.patch.object(
+                bridge, "user_data_root", return_value=data_root / "local"
+            ):
+                for name, context, expected in drift_cases:
+                    with self.subTest(name=name):
+                        with self.assertRaisesRegex(
+                            bridge.CodexP4DiffError, expected
+                        ):
+                            bridge.ensure_history_repo(context, project)
+
+            self.assertEqual(marker.read_bytes(), marker_before)
+            self.assertEqual(
+                bridge.git_output(original.git_exe, project, ["rev-parse", "HEAD"]),
+                head_before,
+            )
+
+    def test_doctor_without_initialize_rejects_explicit_marker_identity_conflicts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            nested = project / "Project" / "Source"
+            nested.mkdir(parents=True)
+            self.make_context(data_root / "local", project)
+            conflicts = [
+                (
+                    "client",
+                    {"client": "other-client"},
+                    "已有本地历史绑定 P4 client test-client",
+                ),
+                (
+                    "port",
+                    {"port": "other-p4.example.test:1666"},
+                    "已有本地历史绑定 P4 port p4.example.test:1666",
+                ),
+            ]
+
+            for name, arguments, expected in conflicts:
+                with self.subTest(name=name), mock.patch.object(
+                    bridge, "discover_p4_context"
+                ) as discover:
+                    report = bridge.doctor_report(
+                        nested,
+                        initialize=False,
+                        **arguments,
+                    )
+
+                self.assertFalse(report["ready"])
+                self.assertIn(expected, report["error"])
+                self.assertFalse(report["checks"][-1]["ok"])
+                self.assertIn(expected, report["checks"][-1]["hint"])
+                discover.assert_not_called()
+            self.assertFalse((nested / ".git").exists())
+
+    def test_doctor_without_initialize_reports_wrong_branch_and_remote_read_only(
+        self,
+    ) -> None:
+        scenarios = [
+            (
+                "branch",
+                ["symbolic-ref", "HEAD", "refs/heads/wrong-history-branch"],
+                "本地历史必须停留在固定分支",
+            ),
+            (
+                "remote",
+                ["remote", "add", "origin", "https://example.invalid/history.git"],
+                "本地历史仓库不允许配置 Git remote",
+            ),
+            (
+                "pre-push",
+                None,
+                "本地历史 pre-push 发布阻断内容无效",
+            ),
+        ]
+        for name, setup_command, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                data_root = Path(temp).resolve()
+                project = data_root / "workspace"
+                nested = project / "Project" / "Source"
+                nested.mkdir(parents=True)
+                original = self.make_context(data_root / "local", project)
+                if setup_command is None:
+                    (project / ".git" / "hooks" / "pre-push").write_text(
+                        "#!/bin/sh\nexit 0\n",
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                else:
+                    bridge.git_output(original.git_exe, project, setup_command)
+                git_files_before = {
+                    path.relative_to(project / ".git").as_posix(): path.read_bytes()
+                    for path in (project / ".git").rglob("*")
+                    if path.is_file()
+                }
+                state_files_before = {
+                    path.relative_to(original.state_root).as_posix(): path.read_bytes()
+                    for path in original.state_root.rglob("*")
+                    if path.is_file()
+                }
+
+                with (
+                    mock.patch.object(
+                        bridge, "user_data_root", return_value=data_root / "local"
+                    ),
+                    mock.patch.object(
+                        bridge,
+                        "discover_p4_context",
+                        return_value=dict(original.p4),
+                    ),
+                ):
+                    report = bridge.doctor_report(nested, initialize=False)
+
+                self.assertFalse(report["ready"])
+                self.assertIn(expected, report["error"])
+                git_files_after = {
+                    path.relative_to(project / ".git").as_posix(): path.read_bytes()
+                    for path in (project / ".git").rglob("*")
+                    if path.is_file()
+                }
+                state_files_after = {
+                    path.relative_to(original.state_root).as_posix(): path.read_bytes()
+                    for path in original.state_root.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(git_files_after, git_files_before)
+                self.assertEqual(state_files_after, state_files_before)
+                self.assertFalse((nested / ".git").exists())
+
+    def test_hook_surfaces_discovered_client_and_server_drift_for_owned_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            project.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            drift_cases = [
+                (
+                    "client",
+                    {**original.p4, "client": "returned-other-client"},
+                    "client=returned-other-client, expected=test-client",
+                ),
+                (
+                    "server",
+                    {
+                        **original.p4,
+                        "serverAddress": "returned-other-p4.example.test:1666",
+                    },
+                    "server=returned-other-p4.example.test:1666, "
+                    "expected=p4.example.test:1666",
+                ),
+            ]
+
+            for name, discovered, expected in drift_cases:
+                session_id = f"discovery-drift-{name}"
+                with self.subTest(name=name), mock.patch.object(
+                    bridge, "discover_p4_context", return_value=discovered
+                ):
+                    result, output = self.run_hook(
+                        {
+                            "hook_event_name": "SessionStart",
+                            "cwd": str(project),
+                            "session_id": session_id,
+                        }
+                    )
+
+                self.assertEqual(result, 0)
+                self.assertTrue(output)
+                response = json.loads(output)
+                hook_output = response["hookSpecificOutput"]
+                self.assertIn("codex-p4-diff", hook_output["additionalContext"])
+                self.assertIn(expected, hook_output["additionalContext"])
+                self.assertNotIn("permissionDecision", hook_output)
+                session_file = (
+                    original.state_root
+                    / "sessions"
+                    / bridge.sanitize_component(session_id, 80)
+                    / "session.json"
+                )
+                self.assertFalse(session_file.exists())
+
+    def test_owned_legacy_pointer_p4_failure_is_visible_but_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            local_root = data_root / "local"
+            project = data_root / "workspace"
+            nested = project / "Project" / "Source"
+            nested.mkdir(parents=True)
+            legacy_git = local_root / "CodexP4Diff" / "Native" / "legacy" / "git"
+            legacy_git.mkdir(parents=True)
+            pointer = project / ".git"
+            pointer.write_text(f"gitdir: {legacy_git}\n", encoding="utf-8")
+            pointer_before = pointer.read_bytes()
+
+            with (
+                mock.patch.object(bridge, "user_data_root", return_value=local_root),
+                mock.patch.object(
+                    bridge,
+                    "discover_p4_context",
+                    side_effect=bridge.CodexP4DiffError(
+                        "owned legacy P4 mapping unavailable"
+                    ),
+                ) as discover,
+            ):
+                result, output = self.run_hook(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "cwd": str(nested),
+                        "session_id": "owned-legacy-session",
+                    }
+                )
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output)
+            response = json.loads(output)
+            hook_output = response["hookSpecificOutput"]
+            self.assertIn("codex-p4-diff", hook_output["additionalContext"])
+            self.assertIn(
+                "owned legacy P4 mapping unavailable",
+                hook_output["additionalContext"],
+            )
+            self.assertNotIn("permissionDecision", hook_output)
+            self.assertEqual(discover.call_args.args[0], project)
+            self.assertEqual(pointer.read_bytes(), pointer_before)
+            self.assertTrue(legacy_git.is_dir())
+
+    def test_doctor_from_nested_cwd_reports_owned_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp).resolve()
+            project = data_root / "workspace"
+            nested = project / "Project" / "Source"
+            nested.mkdir(parents=True)
+            original = self.make_context(data_root / "local", project)
+            discovered = dict(original.p4)
+
+            with (
+                mock.patch.object(bridge, "user_data_root", return_value=data_root / "local"),
+                mock.patch.object(
+                    bridge, "discover_p4_context", return_value=discovered
+                ) as discover,
+            ):
+                report = bridge.doctor_report(nested)
+                wrong_state = bridge.storage_paths(discovered, nested)["state"]
+
+            self.assertTrue(report["ready"])
+            self.assertEqual(Path(report["projectRoot"]), project)
+            self.assertEqual(Path(report["historyRoot"]), project)
+            self.assertEqual(report["branch"], bridge.HISTORY_BRANCH)
+            self.assertEqual(report["context"]["client"], "test-client")
+            self.assertEqual(Path(report["context"]["projectRoot"]), project)
+            self.assertEqual(discover.call_args.args[0], project)
+            self.assertFalse((nested / ".git").exists())
+            self.assertFalse(wrong_state.exists())
 
 
 class TurnCommitIntegrationTest(AuditTestCase):

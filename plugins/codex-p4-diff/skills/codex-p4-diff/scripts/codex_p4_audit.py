@@ -376,12 +376,14 @@ def normalize_session_id(value: Any) -> str:
 
 def resolve_context(event: dict[str, Any]) -> AuditContext:
     cwd_text = str(event.get("cwd") or os.getcwd()).strip()
-    project_root = Path(cwd_text).resolve()
-    if not project_root.is_dir():
-        raise HookSkip(f"Codex cwd 不存在：{project_root}")
+    requested_root = Path(cwd_text).resolve()
+    if not requested_root.is_dir():
+        raise HookSkip(f"Codex cwd 不存在：{requested_root}")
     session_id = normalize_session_id(event.get("session_id"))
     try:
-        p4_context = bridge.discover_p4_context(project_root)
+        project_root, p4_context = bridge.resolve_project_p4_context(requested_root)
+    except bridge.ActionableP4ContextError as exc:
+        raise AuditError(str(exc)) from exc
     except bridge.CodexP4DiffError as exc:
         raise HookSkip(str(exc)) from exc
     paths = bridge.storage_paths(p4_context, project_root)

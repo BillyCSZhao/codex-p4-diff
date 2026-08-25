@@ -5,7 +5,7 @@
 ~~~text
 <P4 ProjectRoot>/
 └─ .git/
-   ├─ codex-p4-diff/project.json    # 插件所有权、项目和初始 commit
+   ├─ codex-p4-diff/project.json    # 插件所有权、项目、P4 identity 和初始 commit
    ├─ info/exclude                  # 默认忽略全部未追踪文件；回合路径显式加入
    ├─ hooks/pre-push                # 阻止发布本地审计历史
    └─ refs/notes/codex-p4-diff      # 每条 commit 的完整回合收据
@@ -29,7 +29,15 @@
       └─ transaction.json           # 可幂等续跑的 Git 收尾事务
 ~~~
 
-项目键由 P4 server、client 和项目绝对路径生成，只用于外置 State。0.4 的 `%LOCALAPPDATA%/CodexP4Diff/History` 不迁移、不删除，仍可作为旧记录查看。
+项目键由 P4 server、client 和 owned 项目绝对路径生成，只用于外置 State。从工程子目录启动时仍解析到父级 owned 根，因此不会因 cwd 深度变化产生另一套 State。0.4 的 `%LOCALAPPDATA%/CodexP4Diff/History` 不迁移、不删除，仍可作为旧记录查看。
+
+## P4 identity 与工程根解析
+
+已有 `.git/codex-p4-diff/project.json` 是本地历史的身份边界。marker 中的 `projectRoot`、`client` 和 canonical `serverAddress` 必须完整且与实际 owned 根一致；可选的 `p4Port` 只记录已知连接入口。插件用只读 `p4 info` 和 `p4 where` 重新验证，而不是相信当前 shell 的默认 `P4CLIENT`。显式 Doctor 参数用于诊断，但不能把既有 marker 改绑到另一 client/server。
+
+从任务 cwd 开始向上查找时，最近的 owned marker 决定 `historyRoot` 和 State key。若在到达 owned 根之前遇到外来 Git 仓库或未知 `.git` 指针，查找立即停止；插件既不穿透该边界复用更外层 history，也不接管内部仓库。已确认指向插件本地数据目录的旧式 `.git` 指针会把其所在目录确定为工程根，并只按既有规则迁移，不会越过它复用更外层 history。
+
+没有 owned marker 的首次初始化才使用环境与 P4V workspace 自动发现。若多个 client 都能映射同一目录，插件不猜测选择：Hook 返回可见的 fail-open 审计告警，正常工具操作继续，但歧义解决前不建立该任务的账本或 commit。普通未映射目录仍静默视为不适用。可在预期工程根用 `--port` 和 `--client` 运行 Doctor，确认目标后修正 P4 环境或 workspace 选择。
 
 ## Commit 拓扑
 
@@ -86,13 +94,21 @@ git notes --ref=codex-p4-diff show <commit>
 
 ## 迁移
 
-0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。0.5.3 首次启动会删除旧 shell 解析器产生的非路径记录。0.5.4 把 `ownership.json` 迁移到 schema 8：只保留当前活跃回合 `before.json` 中的真实路径，增加可续期短租约和 epoch-scoped 随机 token，并移除历史 generation 计数表。升级后的标题规则只影响新任务创建的新 commit，不改写已有历史。
+0.3 可能创建 pending CL 和指向插件本地数据的 `.git` 文件；0.5 只会移除已知插件拥有的旧指针，不修改 P4 CL。0.4 外置历史保留原样。若项目已有真实 `.git` 或外来指针，0.5 拒绝接管。0.5.3 首次启动会删除旧 shell 解析器产生的非路径记录。0.5.4 把 `ownership.json` 迁移到 schema 8：只保留当前活跃回合 `before.json` 中的真实路径，增加可续期短租约和 epoch-scoped 随机 token，并移除历史 generation 计数表。0.5.5 复用并验证既有 marker 的 P4 client/server；旧 marker 的 `serverAddress` 与 `client` 字段保持兼容，新建 marker 在连接入口已知时额外记录 `p4Port` 和 `p4User`。升级不会改写已有 commit 或 P4 changelist。
 
 ## 常见问题
 
 ### doctor 显示 `ready=false`
 
-常见原因是 P4 登录失效、项目未映射、Git 缺失、项目已有外来仓库、配置了 remote 或当前不在 `codex/local-history`。插件不会自动切换分支。
+常见原因是 P4 登录失效、项目未映射、owned marker 绑定的 client/server 已无法验证、首次发现多个可映射 client、Git 缺失、项目已有外来仓库、配置了 remote 或当前不在 `codex/local-history`。插件不会猜测 client，也不会自动切换分支。
+
+### 首次启动提示多个 P4 client
+
+这是可见的 fail-open 审计告警，不会阻断正常工具操作，但歧义解决前不会建立本地历史账本。不要任意选择第一个 workspace；在预期工程根用显式 `--port`、`--client` 运行 Doctor，确认正确映射后修正环境或 P4V workspace 选择，再新建任务。
+
+### 从子目录启动却没有复用父级 history
+
+插件只复用向上找到的最近 owned marker。检查子目录与父级 history 之间是否存在更近的真实 Git 仓库或 `.git` 指针；该边界有意阻止穿透。不要删除外来仓库元数据来强行复用外层 history。
 
 ### 回合结束没有 commit
 

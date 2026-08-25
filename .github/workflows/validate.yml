@@ -52,7 +52,7 @@ jobs:
           marketplace = json.loads((root / ".agents/plugins/marketplace.json").read_text(encoding="utf-8"))
           hooks = json.loads((root / "plugins/codex-p4-diff/hooks/hooks.json").read_text(encoding="utf-8"))
           assert manifest["name"] == marketplace["plugins"][0]["name"]
-          assert manifest["version"] == "0.5.4"
+          assert manifest["version"] == "0.5.5"
           assert set(hooks["hooks"]) == {
               "SessionStart",
               "UserPromptSubmit",

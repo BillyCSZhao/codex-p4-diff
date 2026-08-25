@@ -13,6 +13,7 @@ description: 在 P4 工程根的固定本地 Git 分支中记录所有 Codex 会
 - 完整审计收据保存在 `refs/notes/codex-p4-diff`，包含时间、P4 只读元数据、审计覆盖状态、恢复告警和可获取的精确文本补丁。
 - 默认提交不超过 8 MiB 的文件；更大的文件只记录哈希、大小和 P4 元数据。用 `CODEX_P4_DIFF_MAX_BLOB_BYTES` 调整阈值。
 - 仓库不配置 remote，并用 `pre-push` 拒绝 push；不要发布到远程。
+- 从工程子目录启动时向上复用最近的插件 owned history；遇到更近的外来仓库或未知 `.git` 指针时停止，不穿透该边界。已知插件旧指针把所在目录确定为工程根，并沿用既有迁移规则。
 
 ## P4 边界
 
@@ -24,14 +25,14 @@ description: 在 P4 工程根的固定本地 Git 分支中记录所有 Codex 会
 
 ## 自动生命周期
 
-1. `SessionStart` 验证 P4 映射，在 `.repo-setup.lock` 下迁移旧指针并安全初始化或验证插件拥有的 `.git`，检查固定分支、无 remote 和 push 阻断，并建立会话账本。
+1. `SessionStart` 从当前目录向上寻找最近的 owned marker。已有 `.git/codex-p4-diff/project.json` 时复用并通过只读查询验证其项目根、P4 client 和 server；nested cwd 继续使用父级 history/State，外来仓库或未知 `.git` 指针是不可穿透边界，已知插件旧指针则把所在目录确定为工程根。没有 marker 时才使用环境/P4V 发现并初始化。首次多 client 歧义或 owned identity 无法验证时显示 fail-open 审计告警，不建立错误账本，也不阻断正常工具操作。随后在 `.repo-setup.lock` 下安全迁移、初始化或验证插件拥有的 `.git`，检查固定分支、无 remote 和 push 阻断，并建立会话账本。
 2. `UserPromptSubmit` 先补偿项目级恢复队列中的未完成事务或延迟回合，再创建新回合记录，保存脱敏摘要和 prompt SHA-256。补偿仍失败时保留跨会话恢复标记，不阻断新回合。
 3. `PreToolUse` 在 `apply_patch`、`Edit`、`Write` 或明确写入型 shell 工具执行前取得本地回合所有权，并在短共享状态锁内发布写入前清单预留项；文件内容改由“回合 + 路径”独立锁读取，再短暂合并元数据，不能让慢快照阻塞无关会话认领。shell 支持常见命名/位置参数、命令链、调用运算符、重定向、目录和通配符展开；动态、未解析或快照失败的目标写入 `partial` 覆盖告警，不猜测路径，也不阻断命令。
 4. `PostToolUse` 补记执行后才暴露的路径；写入前内容不可用时只生成 partial `after-only-receipt`，不得冒充新增、删除或精确文本补丁。不同 writer 的 uncertainty 证据压缩到有界 scope 摘要；timeout `pending.json` 在压缩时原子取走并提升匿名高水位，乱序覆盖或并发 cleanup 不得漏掉外来写入。
 5. `Stop` 优先恢复已有事务，否则比较前后状态，从 `last_assistant_message` 提取实际改动摘要，在全局固定分支串行创建一个 commit。`.project.lock` 有界等待，分阶段事务日志保证 ref、note 和 index 更新可幂等恢复；若事务创建前超时，在回合级 `.deferred-after.lock` 内只发布第一次 after 快照，再于 `.state.lock` 内验证并密封逐路径 ownership 归因。只有密封成功才释放旧回合认领；另一处理器仍在发布记录时保留认领和项目级恢复标记。冻结失败时只能生成 partial `deferred-after-unavailable-receipt-only`，不得回读后来工作树。Git 收尾完成后在短 `.state.lock` 内重新加载并合并最新 session，只清理本回合，不能覆盖并发新 prompt 或 ownership。主 index 的最终比较与原子替换持有 Git `index.lock`。目标路径原有 staged 内容保持不动并标为 `staged-receipt-only`；不相关或并发变化的 staged 内容同样保持不变。
 6. `SessionEnd` 先尝试补偿尚未完成的回合，再结束本地账本并释放该会话所有权；未完成恢复标记仍可由后续其他会话接力，不执行 P4 写操作。
 
-Hooks 只覆盖经过通用 Tool Hooks 的写入。复杂 shell 或专用工具无法静态识别全部目标路径时，以不中断正常命令为优先，不得猜测路径；必须把 `auditCoverage=partial` 和 `coverageWarnings` 写入本地状态/收据并反馈给任务，不得声称记录了精确写入前内容。普通审计错误按 fail-open 处理；只有确认仍活跃的同路径所有权冲突可以拒绝 `PreToolUse`。
+Hooks 只覆盖经过通用 Tool Hooks 的写入。复杂 shell 或专用工具无法静态识别全部目标路径时，以不中断正常命令为优先，不得猜测路径；必须把 `auditCoverage=partial` 和 `coverageWarnings` 写入本地状态/收据并反馈给任务，不得声称记录了精确写入前内容。普通未映射目录仍静默视为不适用；首次多 client 歧义、owned identity 无法验证及其他可操作审计错误必须向任务显示 fail-open 告警。只有确认仍活跃的同路径所有权冲突可以拒绝 `PreToolUse`。
 
 ## 诊断
 
@@ -54,7 +55,7 @@ sh "$SkillRoot/scripts/run_codex_p4_diff.sh" \
   --doctor
 ~~~
 
-检查 `ready`、`p4Mode`、`p4Writes`、`historyRoot`、`branch` 和 `legacyGitPointer`。`historyRoot` 应等于项目根，`branch` 应为 `codex/local-history`。真实/外来 Git 仓库、未知 `.git` 指针、remote 或错误分支都会停止自动提交，插件不会擅自接管或切换。
+检查 `ready`、`p4Mode`、`p4Writes`、`historyRoot`、`branch` 和 `legacyGitPointer`。`historyRoot` 应等于 owned 项目根；从子目录运行时可以是父目录。`branch` 应为 `codex/local-history`。真实/外来 Git 仓库、未知 `.git` 指针、remote 或错误分支都会停止自动提交，插件不会擅自接管、穿透或切换。首次多 client 歧义可用 `--port` 和 `--client` 显式诊断；已有 marker 的身份冲突必须修复 P4 登录/映射，不能借此改绑历史。
 
 用 `--history-path` 输出项目 Git 根。GitHub Desktop 添加项目根后保持 `codex/local-history`，从 History 查看 `[Codex]` commit。Codex Review 可查看 `Last turn` 或最新 `Commit`；`Unstaged` 只显示尚未被 Stop hook 记录的变化。
 
@@ -75,5 +76,6 @@ git notes --ref=codex-p4-diff show <commit>
 - 不要恢复旧版 `pre-commit` 阻断；本地回合 commit 是核心行为。
 - 不要删除或修改旧版 P4 pending CL；升级只停止插件干预 P4。
 - 不要删除 0.4 外置历史仓库；0.5 不自动导入或清理旧历史。
+- 不要删除 owned marker 来绕过 P4 identity 校验，也不要把既有 history 改绑到另一 client/server。
 - 不要为修正标题而改写已有 commit；新标题规则只应用于升级后新任务创建的 commit。
 - 插件更新后重启 Codex、重新信任 Hooks，并新建任务；旧任务不会热加载新版 Hook。

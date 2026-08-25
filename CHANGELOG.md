@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.5 - 2026-08-25
+
+- Reuse and revalidate the P4 client/server identity stored in an existing plugin-owned `.git/codex-p4-diff/project.json` before ambient environment or P4V discovery, so an unrelated default client or duplicate workspace mapping cannot silently redirect an established local history.
+- Resolve a nested task directory to the nearest parent plugin-owned history while stopping at any closer foreign `.git` boundary. A recognized plugin-owned legacy pointer becomes that directory's project boundary and keeps the existing serialized migration behavior; it is never used to traverse into a farther history.
+- Surface first-time multi-client ambiguity and invalid owned-history identity as visible fail-open Hook warnings without blocking normal tool operations; ordinary unmapped directories remain out of scope, and the runtime P4 whitelist remains read-only.
+
 ## 0.5.4 - 2026-08-08
 
 - Replace age-deleted project lock files with bounded operating-system file locks that require no sentinel writes, and migrate ownership to schema 8 renewable short leases with random registry epochs and per-claim tokens that cannot be reused after registry rebuild.
