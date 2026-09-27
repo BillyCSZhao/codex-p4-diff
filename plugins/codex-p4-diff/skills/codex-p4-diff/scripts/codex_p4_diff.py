@@ -635,10 +635,27 @@ def resolve_project_p4_context(
             marker_server
             and resolved_server.casefold() != marker_server.casefold()
         ):
-            failures.append(
-                f"{source}: server={resolved_server or '<missing>'}, expected={marker_server}"
+            # Older markers could record the broker endpoint as serverAddress.
+            # Prove that alias through a fresh connection to that exact endpoint;
+            # never accept a caller-supplied port alone or relax modern identities.
+            info = candidate.get("info") or {}
+            legacy_broker_match = (
+                not marker_port
+                and bool(resolved_server)
+                and (attempt_port or "").casefold() == marker_server.casefold()
+                and str(info.get("brokerAddress") or "").strip().casefold()
+                == marker_server.casefold()
             )
-            return None
+            if not legacy_broker_match:
+                failures.append(
+                    f"{source}: server={resolved_server or '<missing>'}, expected={marker_server}"
+                )
+                return None
+            candidate = dict(candidate)
+            candidate["resolvedServerAddress"] = resolved_server
+            candidate["serverIdentitySource"] = "validated-legacy-broker"
+            # Keep existing State/ownership/recovery keys and marker immutable.
+            candidate["serverAddress"] = marker_server
         candidate["source"] = "owned-history-marker"
         candidate["historyMarker"] = str(owned_repo_marker(project_root / ".git"))
         if connection_map_text:
@@ -935,6 +952,9 @@ def doctor_report(
             key: context[key]
             for key in ("serverAddress", "userName", "client", "clientRoot", "projectRoot")
         }
+        for key in ("resolvedServerAddress", "serverIdentitySource"):
+            if key in context:
+                report["context"][key] = context[key]
         report["checks"].append({"name": "p4-readonly-context", "ok": True})
         if initialize:
             history = ensure_history_repo(context, project_root, git_exe=git_exe)

@@ -35,6 +35,8 @@
 
 已有 `.git/codex-p4-diff/project.json` 是本地历史的身份边界。marker 中的 `projectRoot`、`client` 和 canonical `serverAddress` 必须完整且与实际 owned 根一致；可选的 `p4Port` 只记录已知连接入口。插件用只读 `p4 info` 和 `p4 where` 重新验证，而不是相信当前 shell 的默认 `P4CLIENT`。显式 Doctor 参数用于诊断，但不能把既有 marker 改绑到另一 client/server。
 
+兼容旧 marker 把 broker 入口保存在 `serverAddress` 的情况：仅在 marker 没有 `p4Port`，且重新连接 marker 中的原地址后，实时 `p4 info` 的 `brokerAddress` 与原地址完全匹配、client 和项目映射通过验证时接受该别名。保持 marker 和 State key 不变，实际后端地址单独报告为 `resolvedServerAddress`，验证来源为 `validated-legacy-broker`。现代 marker、错误 broker、未经验证的连接别名和 client 冲突仍拒绝。
+
 从任务 cwd 开始向上查找时，最近的 owned marker 决定 `historyRoot` 和 State key。若在到达 owned 根之前遇到外来 Git 仓库或未知 `.git` 指针，查找立即停止；插件既不穿透该边界复用更外层 history，也不接管内部仓库。已确认指向插件本地数据目录的旧式 `.git` 指针会把其所在目录确定为工程根，并只按既有规则迁移，不会越过它复用更外层 history。
 
 没有 owned marker 的首次初始化才使用环境与 P4V workspace 自动发现。若多个 client 都能映射同一目录，插件不猜测选择：Hook 返回可见的 fail-open 审计告警，正常工具操作继续，但歧义解决前不建立该任务的账本或 commit。普通未映射目录仍静默视为不适用。可在预期工程根用 `--port` 和 `--client` 运行 Doctor，确认目标后修正 P4 环境或 workspace 选择。
@@ -125,6 +127,8 @@ Stop hook 已把本回合改动提交后，`Unstaged` 为空是正常的。切�
 ### shell 修改没有精确补丁
 
 优先使用 `apply_patch`、`Edit`、`Write`，或在 shell 中使用静态可解析的命名/位置参数和明确重定向目标。解析器支持常见命令链、PowerShell 调用运算符、目录目标与通配符展开。动态变量、响应文件、链接、复杂脚本或路径展开超过上限时不会猜测或阻断，而是记录 `auditCoverage=partial` 和具体 `coverageWarnings`；执行后才发现的路径只记录收据，不能伪造写入前快照。
+
+Shell hooks 同时匹配 `shell_command` 和 `exec_command`，读取 `command` 或 `cmd` 及 `workdir`；显式 Bash/sh/zsh 使用 POSIX 解析规则。
 
 ### 审计告警会阻断命令吗
 

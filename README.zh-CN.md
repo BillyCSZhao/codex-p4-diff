@@ -1,6 +1,6 @@
 # Codex P4 Diff
 
-[English](README.md) | 当前公开版本：[v0.5.5](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.5)
+[English](README.md) | 当前公开版本：[v0.5.6](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.6)
 
 Codex P4 Diff 在 P4 工程根建立一个仅供本地审阅的 Git 历史，不修改 Perforce：
 
@@ -12,7 +12,13 @@ Codex P4 Diff 在 P4 工程根建立一个仅供本地审阅的 Git 历史，不
 
 工程内的本地 Git 仓库没有 remote，并安装 `pre-push` hook 阻止发布。真实工程相对路径可以直接在 Codex Review 和 GitHub Desktop 中审阅。
 
-## v0.5.5 更新
+## v0.5.6 更新
+
+兼容旧账本把 P4 broker 入口保存在服务器地址中的情况：插件重新连接原入口，核对实时 broker 地址、client 和工程映射后复用原账本，保持身份标记与 State key 不变，并通过 `resolvedServerAddress` 单独报告实际后端。现代账本的身份冲突、未经验证的别名仍会被拒绝。
+
+Hook 新增 `exec_command` 写入捕获，支持 `cmd`、`workdir` 和显式 Bash/sh/zsh 选择。固定历史分支与 P4 只读边界保持不变；Hook 不会自动切换分支。
+
+## v0.5.5 引入的身份校验
 
 已有插件本地历史会保持稳定的 P4 身份。插件优先复用并重新验证 `.git/codex-p4-diff/project.json` 中记录的 client 和 server，再考虑环境或 P4V 自动发现，因此错误的默认 `P4CLIENT` 或两个同时映射该目录的 P4V workspace 不会再把既有历史和 State 静默切到另一套身份。
 
@@ -28,7 +34,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-确认 `codex-p4-diff@billycszhao-plugins` 的版本为 `0.5.5`。如果 Windows PowerShell 执行策略阻止 `codex.ps1`，把命令中的 `codex` 改成 `codex.cmd`。
+确认 `codex-p4-diff@billycszhao-plugins` 的版本为 `0.5.6`。如果 Windows PowerShell 执行策略阻止 `codex.ps1`，把命令中的 `codex` 改成 `codex.cmd`。
 
 安装后重启 Codex，信任插件 Hooks，在 P4 工程目录中创建新任务。已经打开的旧任务不会热加载新版 Hook。
 
@@ -40,7 +46,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-如果 `plugin add` 提示已经安装，或者版本仍低于 `0.5.5`，只重装公开 marketplace 下的这个插件：
+如果 `plugin add` 提示已经安装，或者版本仍低于 `0.5.6`，只重装公开 marketplace 下的这个插件：
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins

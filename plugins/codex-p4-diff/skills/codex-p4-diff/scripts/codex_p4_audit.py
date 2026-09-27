@@ -38,7 +38,7 @@ MAX_EXPANDED_SHELL_PATHS = max(
 )
 OWNERSHIP_SCHEMA_VERSION = 8
 CASE_INSENSITIVE_OWNERSHIP_PATHS = os.name == "nt"
-MUTATING_TOOLS = {"apply_patch", "Edit", "Write", "Bash", "shell_command"}
+MUTATING_TOOLS = {"apply_patch", "Edit", "Write", "Bash", "shell_command", "exec_command"}
 IGNORED_TOP_LEVEL = {
     ".git",
     ".svn",
@@ -1702,9 +1702,10 @@ def analyze_tool_paths(ctx: AuditContext, event: dict[str, Any]) -> ToolPathAnal
         path = resolve_candidate_path(ctx, value, cwd)
         if path is not None and path not in paths:
             paths.append(path)
-    if tool_name in {"Bash", "shell_command"}:
+    if tool_name in {"Bash", "shell_command", "exec_command"}:
         command = str(tool_input.get("command") or tool_input.get("cmd") or "")
-        dialect = "posix" if tool_name == "Bash" else "powershell"
+        shell_name = Path(str(tool_input.get("shell") or "")).stem.lower()
+        dialect = "posix" if tool_name == "Bash" or shell_name in {"bash", "sh", "zsh"} else "powershell"
         shell = analyze_shell_command(ctx, command, cwd, dialect)
         mutating = shell.mutating
         for path in shell.paths:

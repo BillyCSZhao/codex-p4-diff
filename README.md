@@ -1,6 +1,6 @@
 # Codex P4 Diff
 
-[简体中文](README.zh-CN.md) | Current release: [v0.5.5](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.5)
+[简体中文](README.zh-CN.md) | Current release: [v0.5.6](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.6)
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
@@ -12,7 +12,13 @@ Codex P4 Diff records Codex changes as local Git history without modifying Perfo
 
 The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
 
-## What's new in v0.5.5
+## What's new in v0.5.6
+
+Legacy histories that recorded a P4 broker endpoint as their server address can resume after the backend address changes: the plugin reconnects to the original endpoint and verifies the live broker address, client, and project mapping. It preserves the marker and State keys, reports the backend as `resolvedServerAddress`, and continues to reject modern identity mismatches and unverified aliases.
+
+Hooks now capture writes made through `exec_command` as well as `shell_command`, including `cmd`, `workdir`, and explicit Bash/sh/zsh selection. The fixed history branch and P4 read-only restrictions remain unchanged; Hooks do not automatically switch branches.
+
+## Identity handling introduced in v0.5.5
 
 An existing plugin-owned history now keeps its P4 identity stable. The client and server recorded in `.git/codex-p4-diff/project.json` are reused and revalidated before ambient environment or P4V discovery, so an unrelated default `P4CLIENT` or two P4V workspaces that map the same directory cannot silently redirect the history or its state.
 
@@ -28,7 +34,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.5`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.6`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
@@ -102,7 +108,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that the installed version is `0.5.5`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+Confirm that the installed version is `0.5.6`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins

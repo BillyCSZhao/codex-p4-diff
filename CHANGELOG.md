@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.6 - 2026-09-27
+
+- Accept a legacy marker that stored the broker endpoint as its server address only after reconnecting to that exact endpoint and verifying the live broker address, client, and project mapping. Preserve the marker and existing State keys; report the resolved backend separately. Modern identity conflicts and unverified aliases still fail validation.
+- Capture `exec_command` writes through PreToolUse and PostToolUse, including `cmd`, `workdir`, and explicit Bash/sh/zsh shell selection. Keep read-only commands outside write tracking.
+- Add regression coverage for broker validation, unchanged history identity, rejected mismatches, and complete before/after capture through local commit creation.
+- Preserve the fixed history branch, P4 read-only boundary, and existing project files. Branch repair remains an explicit maintenance action, not an automatic Hook operation.
+
 ## 0.5.5 - 2026-08-25
 
 - Reuse and revalidate the P4 client/server identity stored in an existing plugin-owned `.git/codex-p4-diff/project.json` before ambient environment or P4V discovery, so an unrelated default client or duplicate workspace mapping cannot silently redirect an established local history.
