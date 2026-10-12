@@ -86,7 +86,7 @@ Git 收尾期间不长期占用 `.state.lock`。写入 committed/no-change/faile
 
 ## 查看历史
 
-在 Codex Review 选择 `Last turn` 或最新 `Commit`。在 GitHub Desktop 添加项目根，保持 `codex/local-history`，从 History 选择 commit。标题表示实际完成的改动；原始请求查看正文 `Request`。完整收据运行：
+在 Codex Review 使用 Git `Commit` / `Branch` 范围查看插件历史。原生 `Last turn` 是宿主单独生成的工具差异，Hook 不能改写它，也不能用它证明并行子任务已经完整收录。在 GitHub Desktop 添加项目根，保持 `codex/local-history`，从 History 选择 commit。标题表示实际完成的改动；原始请求查看正文 `Request`。完整收据运行：
 
 ~~~powershell
 git notes --ref=codex-p4-diff show <commit>
@@ -116,13 +116,21 @@ git notes --ref=codex-p4-diff show <commit>
 
 无文件变化不会创建空 commit。确认 Hook 在写入前识别了目标路径；升级后需重启 Codex、信任新版 Hooks并新建任务。
 
-### commit 标题仍然是用户回复
+### commit 标题仍然是聊天回复，或只列文件名
 
-确认安装版本至少为 `0.5.2`。旧任务不会热加载新版 Stop hook；重启 Codex、重新信任 Hooks 并新建任务。已有 commit 保持不可变，可在正文或 note 中区分实际改动和原始请求。
+新流程不再提取聊天首句。按 [提交描述流程](commit-descriptions.md) 生成并填写本回合的 change-description.json；检查 note 中 descriptionStatus 与 descriptionDiffDigest。文件名摘要代表缺失、过期、范围不完整或证据不足的保守降级，不等于插件已理解功能。新增提示配置需重启 Codex、重新信任 Hooks 并新建任务加载；已有 commit 和冻结事务保持不可变。
 
 ### Review 的 Unstaged 为空
 
-Stop hook 已把本回合改动提交后，`Unstaged` 为空是正常的。切换到 `Last turn` 或最新 `Commit`。
+Stop hook 已把本回合改动提交后，`Unstaged` 为空是正常的。切换到 Git `Commit` / `Branch`；不要假定原生 `Last turn` 与插件 commit 相同。
+
+### 子任务修改未进入主回合
+
+当前宿主把子任务 Hook 的 `session_id` 归到父会话，但工具 `turn_id` 仍为子回合。插件通过 `SubagentStart` 和工具事件中的 `agent_id` 固定关联用户回合，并保留实际 writer 身份；同一路径只保留该用户回合最早的 before。迟到的旧 writer 不并入新的用户回合。旧版本已留下的孤立 before 记录不能只凭时间自动归档，须核对原始归属、before 快照及 after 哈希后补充恢复记录。
+
+### index.lock 一直超时
+
+索引同步另持操作系统租约，并记录本插件锁的 PID、随机标识、仓库路径及文件身份。进程已退出且身份一致时可以回收；活进程、无法确认的进程、身份不符和无归属的外来锁都保留。不要仅按锁文件年龄删除它。旧版遗留的无归属锁需在备份和人工核验后单独恢复。
 
 ### shell 修改没有精确补丁
 

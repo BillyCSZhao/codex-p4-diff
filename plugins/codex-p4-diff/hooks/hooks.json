@@ -10,7 +10,7 @@
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 30,
             "statusMessage": "Preparing local session history",
-            "additionalContextLimit": 500
+            "additionalContextLimit": 1600
           }
         ]
       }
@@ -24,7 +24,34 @@
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
             "timeout": 120,
             "statusMessage": "Preparing local turn snapshot",
+            "additionalContextLimit": 1600
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
+            "timeout": 30,
+            "statusMessage": "Linking subagent changes to the parent turn",
             "additionalContextLimit": 500
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
+            "timeout": 180,
+            "statusMessage": "Finishing subagent change tracking"
           }
         ]
       }
@@ -80,7 +107,7 @@
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex_p4_session.py\"",
             "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'hooks\\run_codex_p4_session.ps1')\"",
-            "timeout": 30,
+            "timeout": 180,
             "statusMessage": "Closing local session history"
           }
         ]

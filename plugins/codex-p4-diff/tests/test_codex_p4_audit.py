@@ -132,7 +132,7 @@ class AuditHelpersTest(AuditTestCase):
         with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", stdout):
             self.assertEqual(audit.hook_main(), 0)
         response = json.loads(stdout.getvalue())
-        self.assertIn("正常工具操作未被阻断", response["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("正常工具操作未被阻断", response["systemMessage"])
 
     def test_parse_apply_patch_paths_includes_move_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -165,19 +165,6 @@ class AuditHelpersTest(AuditTestCase):
         self.assertEqual(
             summary,
             "Fix login token=<redacted> password=<redacted> Bearer <redacted>",
-        )
-
-    def test_extract_assistant_change_summary_skips_generic_markdown(self) -> None:
-        message = (
-            '## 完成情况\n\n'
-            '已完成。\n\n'
-            'Tests passed.\n\n'
-            '- **修复提交记录标题**：现在使用实际改动摘要。\n'
-            '- 测试通过。'
-        )
-        self.assertEqual(
-            audit.extract_assistant_change_summary(message),
-            '修复提交记录标题：现在使用实际改动摘要。',
         )
 
     def test_fallback_change_summary_uses_file_actions(self) -> None:
@@ -1214,6 +1201,14 @@ class ContextResolutionTest(AuditTestCase):
 
 
 class TurnCommitIntegrationTest(AuditTestCase):
+    def provide_description(self, ctx, turn_id, title):
+        paths = audit.description.prepare(ctx, turn_id)
+        report_path = Path(paths['reportPath'])
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+        report.update(title=title, why='原问候语与目标文案不一致。')
+        report['changes'][0]['description'] = title
+        report_path.write_text(json.dumps(report, ensure_ascii=False), encoding='utf-8')
+
     def test_two_changed_turns_create_two_commits_on_fixed_branch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             data_root = Path(temp).resolve()
@@ -1228,12 +1223,14 @@ class TurnCommitIntegrationTest(AuditTestCase):
             audit.record_before_path(ctx, "turn-1", target)
             target.write_text("after one\n", encoding="utf-8")
             first_message = '将问候语更新为第一版。'
+            self.provide_description(ctx, 'turn-1', first_message)
             first = self.finalize(ctx, "turn-1", first_message)
 
             self.start_turn(ctx, "turn-2", "Refine greeting")
             audit.record_before_path(ctx, "turn-2", target)
             target.write_text("after two\n", encoding="utf-8")
             second_message = '将问候语调整为最终版本。'
+            self.provide_description(ctx, 'turn-2', second_message)
             second = self.finalize(ctx, "turn-2", second_message)
 
             self.assertEqual(first["status"], "committed")
@@ -1273,13 +1270,14 @@ class TurnCommitIntegrationTest(AuditTestCase):
                 capture_output=True,
                 text=True,
             ).stdout
-            self.assertIn("Change: 将问候语调整为最终版本。", message)
-            self.assertIn("Change-Summary-Source: assistant", message)
+            self.assertIn("- 将问候语调整为最终版本。", message)
+            self.assertIn("Change-Summary-Source: structured-ai", message)
+            self.assertIn("人工交互：未执行", message)
             self.assertIn("Request: Refine greeting", message)
             self.assertIn("Session: thread-123", message)
             self.assertIn("Turn: turn-2", message)
             self.assertIn("Recorded-At:", message)
-            self.assertIn("p4=-@-/-", message)
+            self.assertIn("P4 mode: read-only", message)
             note = subprocess.run(
                 [
                     ctx.git_exe,
@@ -1296,7 +1294,7 @@ class TurnCommitIntegrationTest(AuditTestCase):
             ).stdout
             receipt = json.loads(note)
             self.assertEqual(receipt["changeSummary"], "将问候语调整为最终版本。")
-            self.assertEqual(receipt["changeSummarySource"], "assistant")
+            self.assertEqual(receipt["changeSummarySource"], "structured-ai")
             self.assertEqual(
                 receipt["assistantMessageSha256"],
                 audit.sha256_bytes(second_message.encode("utf-8")),
@@ -4325,7 +4323,7 @@ class RecoveryAndSafetyTest(AuditTestCase):
                         "turn_id": "turn-warning",
                     }
                 )
-            self.assertIn("partial", feedback["hookSpecificOutput"]["additionalContext"])
+            self.assertIn("partial", feedback["systemMessage"])
 
     def test_project_lock_never_steals_an_active_old_mtime_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

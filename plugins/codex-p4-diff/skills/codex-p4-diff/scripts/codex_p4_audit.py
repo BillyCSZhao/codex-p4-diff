@@ -21,6 +21,7 @@ import time
 from typing import Any, Iterable
 
 import codex_p4_diff as bridge
+import codex_p4_description as description
 
 
 MAX_CAPTURE_BYTES = int(os.environ.get("CODEX_P4_DIFF_MAX_BLOB_BYTES", 8 * 1024 * 1024))
@@ -280,61 +281,6 @@ def redact_summary(text: str, limit: int = 180) -> str:
     return value[:limit]
 
 
-GENERIC_ASSISTANT_SUMMARY_LINES = {
-    '已完成',
-    '完成',
-    '处理完成',
-    '已处理',
-    '完成情况',
-    '完成内容',
-    '更新内容',
-    '修改内容',
-    '改动内容',
-    '主要改动',
-    '结果',
-    '验证',
-    '验证通过',
-    '测试通过',
-    'done',
-    'completed',
-    'summary',
-    'changes',
-    'results',
-    'verification',
-    'testspassed',
-}
-
-
-def strip_basic_markdown(line: str) -> str:
-    value = re.sub(r'^\s{0,3}(?:#{1,6}\s+|>\s*)', '', line)
-    value = re.sub(r'^\s*(?:[-+*]\s+|\d+[.)]\s+)', '', value)
-    value = re.sub(r'^\s*\[[ xX]\]\s+', '', value)
-    value = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', value)
-    value = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', value)
-    value = value.replace('**', '').replace('__', '').replace('~~', '').replace(chr(96), '')
-    return re.sub(r'\s+', ' ', value).strip()
-
-
-def extract_assistant_change_summary(message: Any) -> str | None:
-    text = str(message or '')
-    in_fence = False
-    fence = chr(96) * 3
-    for raw_line in text.splitlines():
-        if raw_line.strip().startswith(fence) or raw_line.strip().startswith('~~~'):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        line = strip_basic_markdown(raw_line)
-        if not line or line.startswith('::') or line.startswith('<oai-'):
-            continue
-        normalized = re.sub(r'[\s。.!！,:：;；]+', '', line).casefold()
-        if normalized in GENERIC_ASSISTANT_SUMMARY_LINES:
-            continue
-        return redact_summary(line)
-    return None
-
-
 def fallback_change_summary(changes: list[dict[str, Any]]) -> str:
     if not changes:
         return '更新文件'
@@ -353,18 +299,19 @@ def fallback_change_summary(changes: list[dict[str, Any]]) -> str:
 
 
 def build_change_summary(
-    event: dict[str, Any], changes: list[dict[str, Any]]
-) -> tuple[str, str, str | None]:
+    ctx: AuditContext, turn_id: str, event: dict[str, Any], changes: list[dict[str, Any]]
+) -> dict[str, Any]:
+    result = description.describe(
+        turn_root(ctx, turn_id) / description.REPORT_NAME, ctx.session_id, turn_id,
+        changes, redact_summary, fallback_change_summary,
+    )
     assistant_message = str(event.get('last_assistant_message') or '')
-    assistant_sha256 = (
+    result['assistantMessageSha256'] = (
         sha256_bytes(assistant_message.encode('utf-8', errors='surrogatepass'))
         if assistant_message
         else None
     )
-    summary = extract_assistant_change_summary(assistant_message)
-    if summary:
-        return summary, 'assistant', assistant_sha256
-    return fallback_change_summary(changes), 'files', assistant_sha256
+    return result
 
 
 def normalize_session_id(value: Any) -> str:
@@ -506,6 +453,9 @@ def save_session(ctx: AuditContext, session: dict[str, Any]) -> None:
 
 
 def normalize_turn_id(ctx: AuditContext, event: dict[str, Any], session: dict[str, Any]) -> str:
+    routed = str(event.get("_codexP4DiffAuditTurnId") or "").strip()
+    if routed:
+        return routed
     explicit = str(event.get("turn_id") or "").strip()
     if explicit:
         return explicit
@@ -513,6 +463,139 @@ def normalize_turn_id(ctx: AuditContext, event: dict[str, Any], session: dict[st
     if active:
         return active
     return f"turn-{int(time.time() * 1000)}"
+
+
+def route_writer_turn(
+    ctx: AuditContext, event: dict[str, Any], session: dict[str, Any]
+) -> str:
+    """Keep a child writer's identity while capturing its parent user's earliest before."""
+    writer_turn = str(event.get("turn_id") or session.get("activeTurnId") or "").strip()
+    agent_id = str(event.get("agent_id") or "").strip()
+    writers = session.setdefault("writerTurns", {})
+    writer = writers.get(writer_turn)
+    active = str(session.get("activeTurnId") or "")
+    turns = session.setdefault("turns", {})
+    if writer is None and agent_id and writer_turn and writer_turn != active:
+        writer = {
+            "agentId": agent_id,
+            "parentTurnId": active or None,
+            "status": "active",
+            "startedAt": utc_now(),
+        }
+        if turns.get(writer_turn, {}).get("auditRole") == "unregistered-writer":
+            writer["detachedTurnId"] = writer_turn
+        writers[writer_turn] = writer
+    if isinstance(writer, dict):
+        if agent_id and writer.get("agentId") not in (None, agent_id):
+            raise AuditError("子任务回合的 agent_id 与已登记身份不一致")
+        parent = str(writer.get("parentTurnId") or "")
+        parent_state = turns.get(parent, {})
+        call_id = str(event.get("tool_use_id") or "unidentified-tool")
+        active_tools = writer.setdefault("activeTools", {})
+        pinned = active_tools.pop(call_id, None) if event.get("hook_event_name") == "PostToolUse" else None
+        if pinned:
+            # A tool that began in an old turn must finish against its original before.
+            audit_turn = pinned
+        elif (
+            parent and parent == active
+            and parent_state.get("status") == "active"
+            and not parent_state.get("closedForChildWrites")
+            and not writer.get("detachedTurnId")
+            and not transaction_path(ctx, parent).exists()
+        ):
+            audit_turn = parent
+        else:
+            # Never append late writes to a completed transaction or the next user prompt.
+            audit_turn = str(writer.get("detachedTurnId") or writer_turn)
+            if turns.get(audit_turn, {}).get("status") in {"committed", "no-changes"}:
+                audit_turn = f"{writer_turn}-late-{int(time.time() * 1000)}"
+            writer["detachedTurnId"] = audit_turn
+            turns.setdefault(audit_turn, {
+                "status": "active", "startedAt": utc_now(),
+                "parentTurnId": parent or None, "auditRole": "late-subagent",
+            })
+            warnings = event.setdefault("_codexP4DiffWarnings", [])
+            if "late-subagent-turn" not in warnings:
+                warnings.append("late-subagent-turn")
+        if event.get("hook_event_name") == "PreToolUse":
+            active_tools[call_id] = audit_turn
+        writer["lastAuditTurnId"] = audit_turn
+        event["_codexP4DiffWriter"] = {
+            "turnId": writer_turn, "agentId": writer.get("agentId"),
+        }
+    else:
+        audit_turn = writer_turn or normalize_turn_id(ctx, event, session)
+        event["_codexP4DiffWriter"] = {"turnId": audit_turn, "agentId": None}
+        if audit_turn != active and audit_turn not in turns:
+            turns[audit_turn] = {
+                "status": "active", "startedAt": utc_now(), "auditRole": "unregistered-writer",
+            }
+            event.setdefault("_codexP4DiffWarnings", []).append("unregistered-writer-turn")
+    event["_codexP4DiffAuditTurnId"] = audit_turn
+    return audit_turn
+
+
+def record_subagent_event(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
+    stopping = event.get("hook_event_name") == "SubagentStop"
+    with project_lock(ctx.state_root, lock_name=".state.lock"):
+        session = load_session(ctx)
+        writer_turn = str(event.get("turn_id") or "")
+        writer = session.get("writerTurns", {}).get(writer_turn)
+        if stopping and isinstance(writer, dict):
+            audit_turn = str(writer.get("lastAuditTurnId") or writer.get("parentTurnId") or writer_turn)
+            event["_codexP4DiffAuditTurnId"] = audit_turn
+        else:
+            audit_turn = route_writer_turn(ctx, event, session)
+            writer = session.get("writerTurns", {}).get(writer_turn)
+        if not isinstance(writer, dict):
+            raise AuditError("子任务生命周期事件缺少可登记的独立 turn_id/agent_id")
+        writer["status"] = "stopped" if stopping else "active"
+        if stopping:
+            writer["finishedAt"] = utc_now()
+            affected_turns = {*writer.pop("activeTools", {}).values(), audit_turn}
+            registry, _ = read_ownership_registry(ctx)
+            for record in registry.get("files", {}).values():
+                if (record.get("sessionId") == ctx.session_id and
+                    record.get("writerTurnId") == writer_turn):
+                    record["writerBusy"] = False
+            atomic_write_json(ownership_path(ctx), registry)
+        save_session(ctx, session)
+    if stopping:
+        results = []
+        for affected in sorted(affected_turns):
+            if (writer.get("detachedTurnId") == affected or
+                session.get("turns", {}).get(affected, {}).get("status") == "awaiting-child-tools"):
+                results.append(finalize_turn(ctx, {**event, "_codexP4DiffAuditTurnId": affected}))
+        if results:
+            return results[0] if len(results) == 1 else {"status": "subagent-recovery", "results": results}
+    return {"status": "subagent-recorded", "parentTurnId": audit_turn}
+
+
+def add_manifest_writer(entry: dict[str, Any], writer: dict[str, Any] | None) -> None:
+    if writer:
+        writers = entry.setdefault("writers", [])
+        if writer not in writers:
+            writers.append(dict(writer))
+
+
+def end_subagent_tools(ctx: AuditContext) -> None:
+    # SessionEnd is also the terminal boundary for children whose Post/Stop was lost.
+    # Keep their before snapshots and recovery markers until normal finalization.
+    with project_lock(ctx.state_root, lock_name=".state.lock"):
+        session = load_session(ctx)
+        for writer in session.get("writerTurns", {}).values():
+            affected = {
+                *writer.pop("activeTools", {}).values(),
+                writer.get("detachedTurnId"), writer.get("lastAuditTurnId"),
+            }
+            writer["status"] = "stopped"
+            for turn_id in affected:
+                if (turn_id and session.get("turns", {}).get(turn_id, {}).get("status")
+                    not in {"committed", "no-changes"}
+                    and not recovery_marker_path(ctx, ctx.session_id, turn_id).exists()):
+                    # No after snapshot was frozen; recovery must still read live content.
+                    queue_turn_recovery(ctx, session, turn_id, "awaiting-child-tools")
+        save_session(ctx, session)
 
 
 def turn_root(ctx: AuditContext, turn_id: str) -> Path:
@@ -1691,6 +1774,28 @@ def analyze_tool_paths(ctx: AuditContext, event: dict[str, Any]) -> ToolPathAnal
     paths: list[Path] = []
     warnings: list[str] = []
     mutating = tool_name in MUTATING_TOOLS
+    if tool_name in {"apply_patch", "Edit", "Write"}:
+        metadata_paths = list(walk_path_values(tool_input))
+        if tool_name == "apply_patch":
+            patch = str(tool_input.get("patch") or tool_input.get("input") or tool_input.get("command") or "")
+            metadata_paths.extend(re.findall(
+                r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to):\s*(.+?)\s*$", patch, re.M))
+        if metadata_paths and all(Path(value).name == description.REPORT_NAME for value in metadata_paths):
+            metadata_session = read_json_if_exists(session_path(ctx), {})
+            active_turn = metadata_session.get("activeTurnId") if isinstance(metadata_session, dict) else None
+            if (active_turn and session_structure_is_valid(metadata_session)
+                    and metadata_session.get("sessionId") == ctx.session_id
+                    and metadata_session.get("turns", {}).get(active_turn, {}).get("status") == "active"
+                    and str(event.get("turn_id") or active_turn) == active_turn
+                    and not transaction_path(ctx, active_turn).exists()):
+                report_path = turn_root(ctx, active_turn) / description.REPORT_NAME
+                # Only this turn's report is metadata; mixed patches and other State writes remain audited.
+                redirected = any(part.is_symlink() or (part.exists() and
+                    getattr(part.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                    for part in (report_path, *report_path.parents))
+                if not redirected and all(
+                        (cwd / value).resolve() == report_path.resolve() for value in metadata_paths):
+                    return ToolPathAnalysis([], [], mutating=False)
     if tool_name == "apply_patch":
         patch_text = str(
             tool_input.get("patch") or tool_input.get("input") or tool_input.get("command") or ""
@@ -2004,6 +2109,7 @@ def reserve_before_path_locked(
     turn_id: str,
     path: Path,
     ownership_generation: str | int | None = None,
+    writer: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Publish a lightweight manifest entry before releasing the ownership lock."""
     relative = relative_path(ctx, path)
@@ -2013,9 +2119,10 @@ def reserve_before_path_locked(
     existing_key = manifest_file_key(files, relative)
     if existing_key is not None:
         existing = files[existing_key]
+        add_manifest_writer(existing, writer)
         if ownership_generation is not None and "ownershipGeneration" not in existing:
             existing["ownershipGeneration"] = ownership_generation
-            atomic_write_json(manifest_path, manifest)
+        atomic_write_json(manifest_path, manifest)
         return existing
     reserved = {
         "path": relative,
@@ -2031,6 +2138,7 @@ def reserve_before_path_locked(
     }
     if ownership_generation is not None:
         reserved["ownershipGeneration"] = ownership_generation
+    add_manifest_writer(reserved, writer)
     files[relative] = reserved
     atomic_write_json(manifest_path, manifest)
     return reserved
@@ -2094,6 +2202,8 @@ def capture_reserved_before_path(
                     return current
                 if current.get("ownershipGeneration") != reserved_generation:
                     return current
+                if current.get("writers"):
+                    metadata["writers"] = current["writers"]
                 if existing_key != relative:
                     del files[existing_key]
             files[relative] = metadata
@@ -2158,14 +2268,19 @@ def owner_record_is_active_turn(
     )
     if not isinstance(session, dict) or str(session.get("status") or "") == "ended":
         return False
-    if str(session.get("activeTurnId") or "") != turn_id:
-        return False
     turns = session.get("turns", {})
     turn_state = turns.get(turn_id, {}) if isinstance(turns, dict) else {}
+    if (str(session.get("activeTurnId") or "") != turn_id
+        and turn_state.get("status") != "awaiting-child-tools"
+        and turn_state.get("auditRole") not in {
+        "late-subagent", "unregistered-writer",
+    }):
+        return False
     return isinstance(turn_state, dict) and str(turn_state.get("status") or "active") in {
         "active",
         "commit-deferred",
         "commit-failed",
+        "awaiting-child-tools",
     }
 
 
@@ -2394,6 +2509,8 @@ def claim_paths(
     paths: list[Path],
     *,
     allow_live_supersede: bool = False,
+    writer: dict[str, Any] | None = None,
+    tool_use_id: str | None = None,
 ) -> ClaimResult:
     registry, _ = read_ownership_registry(ctx)
     for warning in registry.get("recoveryWarnings", []):
@@ -2423,6 +2540,7 @@ def claim_paths(
         relative = relative_path(ctx, path)
         key = ownership_key(relative)
         current = records.get(key)
+        writer_conflict = False
         if isinstance(current, dict) and owner_record_is_live(ctx, relative, current, now_epoch):
             current_session = current.get("sessionId")
             current_turn = current.get("turnId")
@@ -2445,11 +2563,25 @@ def claim_paths(
                     f"文件仍由本 Codex 会话的上一回合记录：{relative} "
                     f"(turn {current_turn})"
                 )
+            if writer and current_session == ctx.session_id and current_turn == turn_id:
+                writer_conflict = bool(current.get("writerBusy")) and (
+                    current.get("writerTurnId", current_turn) != writer.get("turnId")
+                    or (tool_use_id and current.get("writerToolUseId") and
+                        current.get("writerToolUseId") != tool_use_id)
+                )
+                if writer_conflict and not allow_live_supersede:
+                    raise OwnershipConflict(
+                        f"文件仍由同一用户回合中的另一项工具写入：{relative} "
+                        f"(writer turn {current.get('writerTurnId')}, agent {current.get('writerAgentId') or '-'})"
+                    )
+                if writer_conflict:
+                    superseded_paths.append(relative)
         same_claim = (
             isinstance(current, dict)
             and current.get("sessionId") == ctx.session_id
             and current.get("turnId") == turn_id
             and isinstance(current.get("generation"), str)
+            and not writer_conflict
         )
         if same_claim:
             generation = str(current["generation"])
@@ -2466,6 +2598,13 @@ def claim_paths(
             "updatedEpoch": now_epoch,
             "leaseUntilEpoch": lease_until,
         }
+        if writer:
+            records[key].update({
+                "writerTurnId": writer.get("turnId"),
+                "writerAgentId": writer.get("agentId"),
+                "writerToolUseId": tool_use_id,
+                "writerBusy": not allow_live_supersede,
+            })
         claimed[relative] = generation
     refresh_owned_files(session, records, ctx.session_id)
     registry["schemaVersion"] = OWNERSHIP_SCHEMA_VERSION
@@ -3018,37 +3157,134 @@ def sync_main_index(
         )
 
 
+def index_lock_identity(path: Path) -> dict[str, int] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or not info.st_ino:
+        return None
+    return {"device": info.st_dev, "inode": info.st_ino, "ctimeNs": info.st_ctime_ns}
+
+
+def index_lock_owner_exited(pid: int) -> bool:
+    # A live/reused PID or an inaccessible process is never evidence of a stale lock.
+    if not 0 < pid <= 0x7FFFFFFF or pid == os.getpid():
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: PID no longer exists.
+        try:
+            return kernel.WaitForSingleObject(handle, 0) == 0
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def recover_owned_index_lock(ctx: AuditContext, lock_path: Path, owner_path: Path) -> bool:
+    """Called only under the index-owner OS lease; unknown Git locks stay untouched."""
+    owner = read_json_if_exists(owner_path, {})
+    if not isinstance(owner, dict) or owner.get("schemaVersion") != 1:
+        return False
+    if (
+        owner.get("historyRoot") != os.path.normcase(str(ctx.history_root.resolve()))
+        or owner.get("lockPath") != os.path.normcase(str(lock_path.resolve()))
+        or not isinstance(owner.get("token"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", owner["token"])
+        or type(owner.get("pid")) is not int
+    ):
+        return False
+    identity = index_lock_identity(lock_path)
+    if identity is None or owner.get("identity") != identity or not index_lock_owner_exited(owner["pid"]):
+        return False
+    # Recheck after the process query so an externally replaced lock is not removed.
+    if index_lock_identity(lock_path) != identity:
+        return False
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    owner_path.unlink(missing_ok=True)
+    return True
+
+
 def sync_main_index_safely(
     ctx: AuditContext,
     target_entries: dict[str, str | None],
     expected_entries: dict[str, str | None],
     candidate_entries: dict[str, str | None] | None = None,
 ) -> list[str]:
+    # Unlike index.lock, this kernel lease is released even when a hook is killed.
+    # It is separate from the caller's .project.lock to avoid reentrant locking.
+    with project_lock(ctx.state_root, lock_name=".index-owner.lock"):
+        return sync_main_index_with_owner(ctx, target_entries, expected_entries, candidate_entries)
+
+
+def sync_main_index_with_owner(
+    ctx: AuditContext,
+    target_entries: dict[str, str | None],
+    expected_entries: dict[str, str | None],
+    candidate_entries: dict[str, str | None],
+) -> list[str]:
     git_dir = ctx.history_root / ".git"
     index_path = git_dir / "index"
     lock_path = git_dir / "index.lock"
+    owner_path = ctx.state_root / "index-lock-owner.json"
     deadline = time.monotonic() + PROJECT_LOCK_WAIT_SECONDS
     while True:
         try:
             descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
+            if recover_owned_index_lock(ctx, lock_path, owner_path):
+                continue
             if time.monotonic() >= deadline:
                 raise AuditError(f"等待 Git index 锁超时：{lock_path}") from exc
             time.sleep(0.05)
             continue
         else:
-            os.close(descriptor)
             break
 
     temporary_index: Path | None = None
     committed = False
+    identity = index_lock_identity(lock_path)
+    owner = {
+        "schemaVersion": 1,
+        "token": os.urandom(16).hex(),
+        "pid": os.getpid(),
+        "historyRoot": os.path.normcase(str(ctx.history_root.resolve())),
+        "lockPath": os.path.normcase(str(lock_path.resolve())),
+        "identity": identity,
+    }
     try:
+        os.close(descriptor)
+        descriptor = None
+        atomic_write_json(owner_path, owner)
         ctx.session_root.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix="git-main-index-", dir=str(ctx.session_root)
         )
         temporary_index = Path(temporary_name)
         os.close(descriptor)
+        descriptor = None
         if index_path.is_file():
             shutil.copyfile(index_path, temporary_index)
         else:
@@ -3071,6 +3307,8 @@ def sync_main_index_safely(
             return skipped
         sync_main_index(ctx, safe, temporary_index)
         shutil.copyfile(temporary_index, lock_path)
+        owner["identity"] = index_lock_identity(lock_path)
+        atomic_write_json(owner_path, owner)
         replace_deadline = time.monotonic() + PROJECT_LOCK_WAIT_SECONDS
         while True:
             try:
@@ -3083,16 +3321,22 @@ def sync_main_index_safely(
         committed = True
         return skipped
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         if temporary_index is not None:
             try:
                 temporary_index.unlink()
             except FileNotFoundError:
                 pass
         if not committed:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
+            current = index_lock_identity(lock_path)
+            if current is not None and identity is not None and (
+                current["device"], current["inode"]
+            ) == (identity["device"], identity["inode"]):
+                lock_path.unlink(missing_ok=True)
+        remaining_owner = read_json_if_exists(owner_path, {})
+        if isinstance(remaining_owner, dict) and remaining_owner.get("token") == owner["token"]:
+            owner_path.unlink(missing_ok=True)
 
 
 def attach_audit_note(ctx: AuditContext, commit: str, record: dict[str, Any]) -> None:
@@ -3148,6 +3392,21 @@ def commit_is_ancestor(ctx: AuditContext, ancestor: str, descendant: str) -> boo
 def turn_commit_message(ctx: AuditContext, event_record: dict[str, Any]) -> str:
     change_summary = str(event_record["changeSummary"])
     subject = f"[Codex] {change_summary}"[:120]
+    if event_record.get("descriptionVersion") == 1:
+        return "\n".join([
+            subject, "", *description.body_lines(event_record),
+            f"Request: {event_record.get('requestText') or event_record.get('promptSummary') or 'Codex file changes'}",
+            f"Request-Capture: {event_record.get('requestCapture') or 'legacy-summary-only'}",
+            f"Prompt-SHA256: {event_record.get('promptSha256') or '-'}",
+            f"Change-Summary-Source: {event_record['changeSummarySource']}",
+            f"Description-Status: {event_record['descriptionStatus']}",
+            f"Diff-Digest: {event_record['descriptionDiffDigest']}",
+            f"Session: {event_record['sessionId']}", f"Turn: {event_record['turnId']}",
+            f"Recorded-At: {event_record['recordedAt']}",
+            f"Audit-Coverage: {event_record.get('auditCoverage') or 'exact'}",
+            "P4 mode: read-only", "Audit-Notes-Ref: refs/notes/codex-p4-diff", "",
+        ])
+    # Prepared legacy transactions retain their original description format.
     body = [
         subject,
         "",
@@ -3253,14 +3512,14 @@ def prepare_turn_transaction(
                 history_state = "delete-receipt-only"
         change["historyState"] = history_state
 
-    change_summary, change_summary_source, assistant_message_sha256 = build_change_summary(
-        stop_event, changes
-    )
-    summary_record = {
-        "changeSummary": change_summary,
-        "changeSummarySource": change_summary_source,
-        "assistantMessageSha256": assistant_message_sha256,
-    }
+    summary_record = build_change_summary(ctx, turn_id, stop_event, changes)
+    if summary_record["changeSummarySource"] == "structured-ai" and (
+        re.sub(r"[\s。.!！]+", "", summary_record["changeSummary"]).casefold()
+        == re.sub(r"[\s。.!！]+", "", str(prompt.get("summary") or "")).casefold()
+    ):
+        summary_record.update(changeSummary=fallback_change_summary(changes),
+                              changeSummarySource="files", descriptionStatus="request-copy",
+                              changeDescription=None)
     warning_records = coverage_warnings(ctx, turn_id)
     warning_codes = sorted(
         {str(item.get("code") or "") for item in warning_records if item.get("code")}
@@ -3274,9 +3533,12 @@ def prepare_turn_transaction(
         "sessionId": ctx.session_id,
         "turnId": turn_id,
         "sessionSequence": int(session.get("nextSequence") or 1),
+        "parentTurnId": session.get("turns", {}).get(turn_id, {}).get("parentTurnId"),
         "branch": ctx.branch,
         "projectRoot": str(ctx.project_root),
         "promptSummary": prompt.get("summary"),
+        "requestText": prompt.get("requestText"),
+        "requestCapture": prompt.get("requestCapture"),
         "promptSha256": prompt.get("sha256"),
         "promptRecordedAt": prompt.get("recordedAt"),
         "recordedAt": utc_now(),
@@ -3381,6 +3643,10 @@ def rebase_prepared_transaction(
         record_transaction_warning(
             transaction, "branch-advanced-paths-left-receipt-only", drifted
         )
+        description.invalidate(audit_record, "recovery-drifted", fallback_change_summary)
+        if audit_record.get("descriptionVersion") == 1:
+            for key in ("changeSummary", "changeSummarySource", "descriptionStatus", "changeDescription"):
+                transaction["summaryRecord"][key] = audit_record[key]
     message = turn_commit_message(ctx, audit_record)
     candidate = commit_tree_from_entries(ctx, head, safe_entries, message)
     transaction.update(
@@ -3881,9 +4147,12 @@ def record_prompt(ctx: AuditContext, event: dict[str, Any]) -> str:
     ):
         session = load_session(ctx)
         prompt = str(event.get("prompt") or event.get("user_prompt") or "")
+        request_text = redact_summary(prompt, 12_001)
         record = {
             "turnId": turn_id,
             "summary": redact_summary(prompt),
+            "requestText": request_text[:12_000],
+            "requestCapture": "truncated-at-12000" if len(request_text) > 12_000 else "redacted-whitespace-normalized",
             "sha256": sha256_bytes(prompt.encode("utf-8", errors="surrogatepass")),
             "recordedAt": utc_now(),
         }
@@ -3910,16 +4179,21 @@ def prepare_tool(ctx: AuditContext, event: dict[str, Any]) -> int:
             ctx.state_root, lock_name=".state.lock", wait_seconds=TOOL_LOCK_WAIT_SECONDS
         ):
             session = load_session(ctx)
-            turn_id = normalize_turn_id(ctx, event, session)
+            turn_id = route_writer_turn(ctx, event, session)
             if analysis.mutating and not paths:
                 write_uncertainty_markers(ctx, turn_id, (), global_scope=True)
             record_coverage_warnings(ctx, session, turn_id, event, analysis.warnings)
             if paths:
-                claim = claim_paths(ctx, session, turn_id, paths)
+                claim = claim_paths(
+                    ctx, session, turn_id, paths,
+                    writer=event.get("_codexP4DiffWriter"),
+                    tool_use_id=str(event.get("tool_use_id") or "") or None,
+                )
                 for path in paths:
                     relative = relative_path(ctx, path)
                     reserve_before_path_locked(
-                        ctx, turn_id, path, claim.generations.get(relative)
+                        ctx, turn_id, path, claim.generations.get(relative),
+                        writer=event.get("_codexP4DiffWriter"),
                     )
             save_session(ctx, session)
     except ProjectLockTimeout:
@@ -3997,7 +4271,7 @@ def finish_tool(ctx: AuditContext, event: dict[str, Any]) -> int:
             ctx.state_root, lock_name=".state.lock", wait_seconds=PROJECT_LOCK_WAIT_SECONDS
         ):
             session = load_session(ctx)
-            turn_id = normalize_turn_id(ctx, event, session)
+            turn_id = route_writer_turn(ctx, event, session)
             if not paths:
                 record_coverage_warnings(ctx, session, turn_id, event, warnings)
                 save_session(ctx, session)
@@ -4006,7 +4280,9 @@ def finish_tool(ctx: AuditContext, event: dict[str, Any]) -> int:
             manifest = load_before_manifest(ctx, turn_id)
             known = manifest.setdefault("files", {})
             claim = claim_paths(
-                ctx, session, turn_id, paths, allow_live_supersede=True
+                ctx, session, turn_id, paths, allow_live_supersede=True,
+                writer=event.get("_codexP4DiffWriter"),
+                tool_use_id=str(event.get("tool_use_id") or "") or None,
             )
             if claim.superseded_paths:
                 warnings.append("posttool-ownership-conflict-after-execution")
@@ -4030,6 +4306,9 @@ def finish_tool(ctx: AuditContext, event: dict[str, Any]) -> int:
                         "recordedEpoch": time.time(),
                         "warning": "path discovered after tool execution; exact before content unavailable",
                     }
+                entry_key = manifest_file_key(known, relative)
+                if entry_key is not None:
+                    add_manifest_writer(known[entry_key], event.get("_codexP4DiffWriter"))
             if discovered_after_execution:
                 warnings.append("posttool-before-snapshot-unavailable")
             uncertain_relatives = set(claim.superseded_paths)
@@ -4221,6 +4500,24 @@ def finish_no_changes_turn(
     }
 
 
+def seal_child_admission(
+    ctx: AuditContext, event: dict[str, Any]
+) -> tuple[dict[str, Any], str, bool]:
+    with project_lock(ctx.state_root, lock_name=".state.lock"):
+        session = load_session(ctx)
+        turn_id = normalize_turn_id(ctx, event, session)
+        turn_state = session.setdefault("turns", {}).setdefault(turn_id, {})
+        # New tools cannot enter this turn after its after snapshot begins.
+        turn_state["closedForChildWrites"] = True
+        waiting = any(turn_id in writer.get("activeTools", {}).values()
+                      for writer in session.get("writerTurns", {}).values())
+        if waiting:
+            turn_state["status"] = "awaiting-child-tools"
+            queue_turn_recovery(ctx, session, turn_id, "awaiting-child-tools")
+        save_session(ctx, session)
+        return session, turn_id, waiting
+
+
 def _finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
     requested_wait = event.get("_historyLockWaitSeconds")
     wait_seconds = (
@@ -4229,9 +4526,10 @@ def _finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     with project_lock(ctx.state_root, wait_seconds=wait_seconds):
-        session = load_session(ctx)
-        turn_id = normalize_turn_id(ctx, event, session)
-        turn_state = session.setdefault("turns", {}).setdefault(turn_id, {})
+        session, turn_id, waiting = seal_child_admission(ctx, event)
+        if waiting:
+            return {"status": "awaiting-child-tools", "turnId": turn_id}
+        turn_state = session["turns"][turn_id]
         if turn_state.get("status") == "committed":
             return finish_already_committed_turn(ctx, turn_id)
         transaction = load_turn_transaction(ctx, session, turn_id)
@@ -4266,10 +4564,11 @@ def _finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
                 ctx, session, turn_id, event, manifest_warning_codes
             )
         deferred_after = load_deferred_after_record(ctx, turn_id)
+        recovery_marker = read_json_if_exists(recovery_marker_path(ctx, ctx.session_id, turn_id), {})
         deferred_required = bool(
             deferred_after is not None
             or turn_state.get("status") == "commit-deferred"
-            or recovery_marker_path(ctx, ctx.session_id, turn_id).is_file()
+            or (recovery_marker and recovery_marker.get("reason") != "awaiting-child-tools")
         )
         deferred_warning_codes = (
             [str(item) for item in deferred_after.get("warnings", []) if str(item)]
@@ -4394,6 +4693,7 @@ def _finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
                 },
                 "p4": p4_record,
                 "textPatch": bool(patch),
+                "writers": before.get("writers", []),
                 "_beforeData": before_data,
                 "_afterData": after_data,
             }
@@ -4449,10 +4749,20 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
     try:
         return _finalize_turn(ctx, event)
     except ProjectLockTimeout as exc:
-        turn_id = str(event.get("turn_id") or "").strip()
+        turn_id = str(event.get("_codexP4DiffAuditTurnId") or event.get("turn_id") or "").strip()
         if not turn_id:
             turn_id = str(load_session(ctx).get("activeTurnId") or "").strip()
         if turn_id:
+            try:
+                _, turn_id, waiting = seal_child_admission(ctx, event)
+            except ProjectLockTimeout:
+                # Without the state lock, absence of running children is unproven.
+                # Preserve claims and retry later; never freeze or seal an early after.
+                if not recovery_marker_path(ctx, ctx.session_id, turn_id).exists():
+                    queue_turn_recovery(ctx, {}, turn_id, "awaiting-child-tools")
+                raise
+            if waiting:
+                return {"status": "awaiting-child-tools", "turnId": turn_id}
             deferred_warnings: list[str] = []
             if not transaction_path(ctx, turn_id).is_file():
                 try:
@@ -4486,7 +4796,7 @@ def finalize_turn(ctx: AuditContext, event: dict[str, Any]) -> dict[str, Any]:
                 queue_turn_recovery(ctx, {}, turn_id, "history-lock-timeout-unlocked")
         raise
     except (AuditError, bridge.CodexP4DiffError, OSError) as exc:
-        turn_id = str(event.get("turn_id") or "").strip()
+        turn_id = str(event.get("_codexP4DiffAuditTurnId") or event.get("turn_id") or "").strip()
         if not turn_id:
             try:
                 with project_lock(
@@ -4528,8 +4838,16 @@ def mark_session(ctx: AuditContext, status: str) -> None:
         save_session(ctx, session)
 
 
-def additional_context(text: str) -> dict[str, Any]:
-    return {"hookSpecificOutput": {"additionalContext": text}}
+def additional_context(event_name: str, text: str) -> dict[str, Any]:
+    # Only context-bearing events accept this tagged union; Stop uses common output.
+    if event_name in {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"}:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": event_name,
+                "additionalContext": text,
+            }
+        }
+    return {"systemMessage": text}
 
 
 def deny_pretool(reason: str) -> dict[str, Any]:
@@ -4554,10 +4872,24 @@ def post_feedback(reason: str) -> dict[str, Any]:
 def handle_event(event: dict[str, Any]) -> dict[str, Any] | None:
     event_name = str(event.get("hook_event_name") or "")
     ctx = resolve_context(event)
+    if event_name in {"SubagentStart", "SubagentStop"}:
+        result = record_subagent_event(ctx, event)
+        return {"systemMessage": (
+            f"子任务写入归属已记录：{result.get('parentTurnId') or result.get('commit') or result['status']}"
+        )}
     if event_name == "SessionStart":
         mark_session(ctx, "active")
         return additional_context(
-            f"Codex 本地历史已启用：{ctx.branch}；P4 仅做只读查询。历史仓库：{ctx.history_root}"
+            event_name,
+            f"Codex 本地历史已启用：{ctx.branch}。"
+            "P4 只读约束仅适用于 codex-p4-diff 插件自身；"
+            "不限制插件之外经用户授权的 P4 操作，其他独立权限与审批要求仍须遵守。"
+            f"历史仓库：{ctx.history_root}。"
+            "原生“上一轮”卡由 Codex 单独记录；默认由子任务分析和给补丁，"
+            "最终文件写入由主会话执行。并行直接写入后应检查完整 Git 审阅，"
+            "交付前打开覆盖所有 writer 的 Git 审阅，并说明原生卡限制。"
+            "新提交不再从聊天首句猜标题。收尾前按插件 references/commit-descriptions.md "
+            "读取最终差异并填写本回合专用变更报告；缺失或过期时只记录文件事实。"
         )
     if event_name == "UserPromptSubmit":
         turn_id = record_prompt(ctx, event)
@@ -4565,16 +4897,25 @@ def handle_event(event: dict[str, Any]) -> dict[str, Any] | None:
         suffix = ""
         if isinstance(recovery, dict):
             suffix = f"；上一回合恢复结果：{recovery.get('status')}"
-        return additional_context(f"本回合将在有文件变化时自动提交本地 Git：{turn_id}{suffix}")
+        guide = Path(__file__).resolve().parent.parent / "references" / "commit-descriptions.md"
+        command = (f'python -X utf8 -B "{Path(__file__).with_name("codex_p4_description.py")}" prepare '
+                   f'--workspace "{ctx.project_root}" --session "{ctx.session_id}" --turn "{turn_id}"')
+        return additional_context(event_name,
+            f"本回合将在有文件变化时自动提交本地 Git：{turn_id}{suffix}。"
+            f"最终写入和子任务结束后、最终回复前，阅读 {guide}，执行 {command}，"
+            "读取输出的差异上下文并填写 reportPath（不改已有 sessionId/turnId/diffDigest）。"
+            "标题写实际行为变化；原始需求另存；构建、自动测试、人工验证分别填写结果和证据。"
+            "随后若继续改文件，重新 prepare 并更新报告。不要把普通最终回复当提交描述。")
     if event_name == "PreToolUse":
         count = prepare_tool(ctx, event)
         warnings = list(event.get("_codexP4DiffWarnings") or [])
         if warnings:
             return additional_context(
+                event_name,
                 f"已记录 {count} 个明确写入目标；审计覆盖不完整（{', '.join(warnings)}），"
                 "命令不会因此被阻断。"
             )
-        return additional_context(f"已为本回合记录 {count} 个文件的写入前状态") if count else None
+        return additional_context(event_name, f"已为本回合记录 {count} 个文件的写入前状态") if count else None
     if event_name == "PostToolUse":
         finish_tool(ctx, event)
         warnings = list(event.get("_codexP4DiffWarnings") or [])
@@ -4587,6 +4928,10 @@ def handle_event(event: dict[str, Any]) -> dict[str, Any] | None:
         )
     if event_name == "Stop":
         result = finalize_turn(ctx, event)
+        if result["status"] == "awaiting-child-tools":
+            return additional_context(
+                event_name, "本回合仍有子任务写入尚未结束；已保留原始快照，待子任务结束后完成本地 Git 审计。"
+            )
         if result["status"] == "committed":
             warning_codes = [
                 str(item.get("code") if isinstance(item, dict) else item)
@@ -4598,6 +4943,7 @@ def handle_event(event: dict[str, Any]) -> dict[str, Any] | None:
                 else ""
             )
             return additional_context(
+                event_name,
                 f"本回合已提交本地 Git {result['commit'][:12]} 到 {result['branch']}，"
                 f"共 {result['files']} 个文件；P4 未被修改{coverage_suffix}。"
             )
@@ -4610,15 +4956,18 @@ def handle_event(event: dict[str, Any]) -> dict[str, Any] | None:
                 else ""
             )
             return additional_context(
+                event_name,
                 f"本回合本地 Git 已提交{f'：{commit[:12]}' if commit else ''}；"
                 f"未重复创建 commit{coverage_suffix}。"
             )
         if result.get("auditCoverage") == "partial":
             return additional_context(
+                event_name,
                 "本回合未识别到可提交的文件变化，但存在审计覆盖缺口；未创建空 Git commit。"
             )
-        return additional_context("本回合没有文件变化，因此未创建空 Git commit。")
+        return additional_context(event_name, "本回合没有文件变化，因此未创建空 Git commit。")
     if event_name == "SessionEnd":
+        end_subagent_tools(ctx)
         retry_previous_turn(ctx, None)
         mark_session(ctx, "ended")
         return None
@@ -4626,9 +4975,12 @@ def handle_event(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def hook_main() -> int:
+    event_name = ""
     raw = sys.stdin.buffer.read()
     try:
         event = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        if isinstance(event, dict):
+            event_name = str(event.get("hook_event_name") or "")
         result = handle_event(event)
         if result is not None:
             print(json.dumps(result, ensure_ascii=False))
@@ -4636,24 +4988,15 @@ def hook_main() -> int:
     except HookSkip:
         return 0
     except OwnershipConflict as exc:
-        event_name = ""
-        try:
-            event_name = str(json.loads(raw.decode("utf-8")).get("hook_event_name") or "")
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            pass
-        result = deny_pretool(str(exc)) if event_name == "PreToolUse" else additional_context(str(exc))
+        result = deny_pretool(str(exc)) if event_name == "PreToolUse" else additional_context(event_name, str(exc))
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (AuditError, bridge.CodexP4DiffError, OSError, json.JSONDecodeError) as exc:
-        event_name = ""
-        try:
-            event_name = str(json.loads(raw.decode("utf-8")).get("hook_event_name") or "")
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            pass
         if event_name == "PostToolUse":
             result = post_feedback(f"codex-p4-diff 审计警告：{exc}")
         else:
             result = additional_context(
+                event_name,
                 f"codex-p4-diff 审计警告（正常工具操作未被阻断）：{exc}"
             )
         print(json.dumps(result, ensure_ascii=False))
@@ -4662,6 +5005,7 @@ def hook_main() -> int:
         print(
             json.dumps(
                 additional_context(
+                    event_name,
                     f"codex-p4-diff 审计警告（正常工具操作未被阻断）：{exc}"
                 ),
                 ensure_ascii=False,

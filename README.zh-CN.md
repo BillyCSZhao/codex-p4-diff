@@ -1,16 +1,25 @@
 # Codex P4 Diff
 
-[English](README.md) | 当前公开版本：[v0.5.6](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.6)
+[English](README.md) | 当前公开版本：[v0.6.0](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.6.0)
 
 Codex P4 Diff 在 P4 工程根建立一个仅供本地审阅的 Git 历史，不修改 Perforce：
 
 - 所有 Codex 会话共用固定的 `codex/local-history` 分支；
 - 每个有文件变化的用户回合自动创建一个本地 Git commit；
-- commit 标题描述实际完成的改动，正文保留脱敏后的原始需求、会话、回合、路径、前后哈希和大小；
+- commit 标题说明实际行为变化，正文区分修改原因、实际实现、分类验证、已知限制与脱敏原始需求；
 - `refs/notes/codex-p4-diff` 保存完整审计收据和可获取的精确文本补丁；
 - P4 只允许只读查询，不创建、修改或提交 changelist。
 
-工程内的本地 Git 仓库没有 remote，并安装 `pre-push` hook 阻止发布。真实工程相对路径可以直接在 Codex Review 和 GitHub Desktop 中审阅。
+工程内生成的本地 Git 历史没有 remote，并安装 `pre-push` hook 阻止发布；这不限制本公开插件源码仓库的正常发布。真实工程相对路径可以直接在 Codex Review 和 GitHub Desktop 中审阅。
+
+## v0.6.0 更新
+
+- **提交说明可独立理解**：执行任务的 AI 阅读最终差异，提供专用变更报告；插件校验回合、完整已捕获文件集合、前后哈希和归档归属。缺失或过期时明确降级为文件事实，不再抓取“已完成，可以手测”等收尾语。
+- **意图、实现与验证分开**：保留脱敏原始请求，说明实际变化，分别记录构建、自动测试、人工交互。验证由执行者提供，插件不复跑、不额外调用模型；旧提交和已冻结旧事务保持原样。
+- **汇总主任务与子任务**：子任务写入纳入所属主回合，保留实际 writer 和最早快照，等待未结束工具后再归档。精确 before/after 审阅覆盖已记录变化，但不能回填 Codex 原生“上一轮”卡。
+- **谨慎恢复 index 锁**：只恢复能够证明由已结束插件 writer 创建的遗留锁，保留其他锁和 staged 数据。
+
+详见[提交说明流程与案例](plugins/codex-p4-diff/skills/codex-p4-diff/references/commit-descriptions.md)及[更新日志](CHANGELOG.md)。v0.5.6 的 broker 校验和 `exec_command` 捕获修复继续保留。
 
 ## v0.5.6 更新
 
@@ -34,7 +43,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-确认 `codex-p4-diff@billycszhao-plugins` 的版本为 `0.5.6`。如果 Windows PowerShell 执行策略阻止 `codex.ps1`，把命令中的 `codex` 改成 `codex.cmd`。
+确认 `codex-p4-diff@billycszhao-plugins` 的版本为 `0.6.0`。如果 Windows PowerShell 执行策略阻止 `codex.ps1`，把命令中的 `codex` 改成 `codex.cmd`。
 
 安装后重启 Codex，信任插件 Hooks，在 P4 工程目录中创建新任务。已经打开的旧任务不会热加载新版 Hook。
 
@@ -46,7 +55,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-如果 `plugin add` 提示已经安装，或者版本仍低于 `0.5.6`，只重装公开 marketplace 下的这个插件：
+如果 `plugin add` 提示已经安装，或者版本仍低于 `0.6.0`，只重装公开 marketplace 下的这个插件：
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
@@ -55,6 +64,10 @@ codex plugin list --json
 ```
 
 不要误删其他 marketplace 中的本地开发版插件。升级后需要重启 Codex、重新信任 Hooks，并新建任务。
+
+可直接发给其他 Codex 会话的更新提示词：
+
+> 请把公开插件 codex-p4-diff@billycszhao-plugins 从 https://github.com/BillyCSZhao/codex-p4-diff 更新到最新正式版本（本次发布为 v0.6.0）。先确认当前安装版本、marketplace 来源和本机支持的命令，再仅刷新该 marketplace 并安装新版；仍停留旧版时，允许仅重装这个公开插件。保留其他 marketplace、本地开发副本、工程 .git、State 和全部历史；若来源固定在旧 tag，先识别这一情况再调整来源。完成后核对实际安装版本和来源，并在我的目标 P4 工程运行只读 Doctor，说明已验证项以及重启 Codex、信任新 Hooks、新建任务的生效步骤。不要声称旧任务已热更新或原生旧“上一轮”卡已修复。只有缺少工程路径或存在无法可靠判断的冲突时才询问。
 
 ## 自动记录规则
 
@@ -68,9 +81,11 @@ shell 命令只有在 Hook 能静态解析真实文件目标时才参与同路�
 
 `PreToolUse` 只在短暂持有共享状态锁时发布路径所有权和轻量的写入前清单预留项，随后在“回合 + 文件”独立锁下读取文件内容，并短暂重新取得状态锁合并快照元数据。慢速或较大的快照不会再让无关会话因状态锁超时而漏掉认领。仅在 `PostToolUse` 才发现的路径或 before 快照失败会明确降级为 partial `after-only-receipt`，不会伪造新增、删除或文本补丁，也不会阻断工具。每个 uncertainty scope 最多保留两个 writer 摘要和一个常态 timeout `pending.json`；压缩时先原子取走 pending，再把匿名时间提升到压缩时刻，因此乱序 writer 和并发清理都不会隐藏证据。
 
-commit 标题格式为 `[Codex] <实际完成的改动>`。插件从助手最终回复中提取第一条有效内容，并跳过空泛标题、纯状态行、代码块和 Codex 指令。无法提取时，按本回合文件动作和文件名生成确定性标题。
+commit 标题格式为 `[Codex] <实际行为变化>`。最终写入和子任务结束后，执行任务的 AI 按 Hook 提供的 `prepare` 命令读取差异上下文，填写本回合专用报告。插件校验最终捕获的路径、动作和哈希。缺失、无效、过期、漏文件或归属不确定时，使用文件动作标题并写明降级原因；不从聊天猜标题，也不默认验证通过。哈希绑定只证明报告对应哪份已捕获差异，不能证明每句自然语言都正确；审计覆盖不完整仍显示 partial。
 
-commit 正文包含 `Change`、`Change-Summary-Source`、脱敏后的原始 `Request`、session/turn ID、文件动作、哈希、大小和历史状态。完整 note 还包含 `changeSummary`、`changeSummarySource`、`assistantMessageSha256`、`promptSummary`、prompt SHA-256、P4 只读元数据和可获取的精确文本补丁。note 只保存助手回复的哈希，不复制完整回复正文。
+新 commit 正文包含原因、实际变更及对应文件、必要的取舍与限制、分类验证、脱敏 `Request`、报告状态与来源、差异摘要及 session/turn ID。例如标题写“修复句柄选择优先级”，验证另写“构建通过；人工交互未执行”。完整 note 保留精确文件哈希、大小、P4 只读元数据、补丁、writer 身份、`changeDescription`、`descriptionStatus` 和 `descriptionDiffDigest`。
+
+新回合的 `requestText` 保存脱敏并归一化空白后的原始请求，最多 12,000 字符，`requestCapture` 明确标记截断，另保留原始 prompt SHA-256。兼容保留 `promptSummary`；旧 prompt 只有摘要时沿用原记录，不读取旧聊天补写。note 只保存助手回复的哈希，不复制完整回复正文。
 
 默认只把不超过 8 MiB 的文件内容写入 Git。更大的文件仍会在 notes 中记录哈希、大小和 P4 元数据。可通过 `CODEX_P4_DIFF_MAX_BLOB_BYTES` 调整阈值。
 
@@ -78,7 +93,7 @@ commit 正文包含 `Change`、`Change-Summary-Source`、脱敏后的原始 `Req
 
 在 GitHub Desktop 中选择 **File > Add Local Repository**，添加 P4 工程根，保持在 `codex/local-history` 分支，然后从 **History** 查看各回合 commit。不要点击 Publish。
 
-在 Codex Review 中查看 `Last turn` 或最新 `Commit`。Stop hook 已经记录的修改不会继续出现在 `Unstaged` 中，因此 `Unstaged` 为空通常是正常现象。
+在 Codex 中使用 Git commit/branch 审阅，或通过 GitHub Desktop History 查看完整归档。Stop hook 已记录的修改不会继续出现在 `Unstaged` 中。Codex 原生 `Last turn` /“上一轮”卡由宿主单独维护，可能遗漏子任务直接写入，插件提交不能回填它。默认让子任务分析、提供补丁，由主任务最终写入；子任务直接写入时，交付前通过 Git 核对全部 writer。
 
 查看一条 commit 的完整审计收据：
 
@@ -127,8 +142,8 @@ $Runner = Join-Path $SkillRoot 'scripts\run_codex_p4_diff.ps1'
 - 0.5.4 会把所有权状态迁移到 schema 8，只保留所属活跃回合写入前清单中的真实路径，并用可续期短租约和 epoch-scoped token 防止 registry 重建后的旧 token 复用；不再保留随历史路径增长的 generation 计数表。
 - 0.5.5 会复用并验证已有 owned marker 的 P4 client/server，并让首次多 client 歧义显示为可见告警；既有 P4 changelist 和历史 commit 不会被改写。
 - 回合结束没有 commit：确认该回合确实改了文件，并确认升级后已经重启 Codex、信任 Hooks、新建任务。
-- 新 commit 标题仍显示用户回复：旧任务不会热加载新版 Hook；确认版本至少为 `0.5.2` 后重启 Codex、重新信任 Hooks并新建任务。旧 commit 保持原样。
-- `Unstaged` 为空：切换到 `Last turn` 或最新 `Commit`。
+- 新 commit 标题仍是聊天文案：确认版本为 `0.6.0` 或更新版本，重启 Codex、重新信任 Hooks 并新建任务；旧 commit 保持原样。新标题只列文件名时，检查 `Description-Status` 和专用报告，不应再从聊天首句提取。
+- `Unstaged` 为空：切换到最新 Git commit/branch 审阅；原生“上一轮”卡不是完整归档的保证。
 - 首次发现多个可映射 client：在预期工程根用 `--port` 和 `--client` 显式运行 Doctor，修正 P4 环境或 P4V workspace 选择后再新建任务。Hook 告警按 fail-open 处理，不阻断正常工具操作；歧义未解决时不会建立该任务的历史记录。
 - 已有 owned marker 无法验证：修复 marker 所绑定 client/server 的 P4 登录或映射，不要删除 marker，也不要把既有 history 改绑到另一 client。
 - Doctor 显示 `ready=false`：检查 P4 登录和映射、Git 是否可用、工程是否已有外来 `.git`、是否配置了 remote，以及当前分支是否为 `codex/local-history`。

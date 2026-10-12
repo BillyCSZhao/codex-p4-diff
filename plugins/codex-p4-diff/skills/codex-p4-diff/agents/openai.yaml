@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex P4 Diff"
-  short_description: "工程内固定 Git 分支，回合级自动 commit"
+  short_description: "本地回合历史、子任务归档与实际变更说明"
   default_prompt: "使用 $codex-p4-diff 检查当前工程固定本地 Git 分支上的回合 commit，并确认 P4 仅被只读查询。"

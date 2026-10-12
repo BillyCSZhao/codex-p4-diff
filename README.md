@@ -1,16 +1,25 @@
 # Codex P4 Diff
 
-[简体中文](README.zh-CN.md) | Current release: [v0.5.6](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.5.6)
+[简体中文](README.zh-CN.md) | Current release: [v0.6.0](https://github.com/BillyCSZhao/codex-p4-diff/tree/v0.6.0)
 
 Codex P4 Diff records Codex changes as local Git history without modifying Perforce:
 
 - the P4 project root becomes one local Git repository on `codex/local-history`;
 - every changed user turn from every Codex session becomes one automatic local commit;
-- commit titles summarize the completed change, while the body preserves the redacted request, session, turn, paths, hashes, and sizes;
+- commit titles describe actual behavior changes; the body separates reasons, implementation, verification, limitations, and the redacted request;
 - immutable audit details are stored in `refs/notes/codex-p4-diff`;
 - Perforce is restricted to read-only queries.
 
-The repository has no remote and a `pre-push` hook blocks publication. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
+The generated project history has no remote and a `pre-push` hook blocks publication. This restriction applies to recorded project history, not this public plugin-source repository. Real project-relative paths make the commits visible in Codex Review and GitHub Desktop.
+
+## What's new in v0.6.0
+
+- **Useful commit descriptions:** the executing AI reads the final diff and provides a dedicated report. The plugin checks the turn, complete captured file set, before/after hashes, and attribution before saving it. Missing or stale reports fall back to explicit file facts; ordinary final replies are no longer used as titles.
+- **Separate intent, implementation, and evidence:** retain the redacted current request, explain actual changes, and report build, automated, and manual checks independently. Verification is executor-reported; the plugin does not rerun tests or call another model. Existing commits and frozen legacy descriptions are unchanged.
+- **Parent and subagent coverage:** link child writes to their parent turn, preserve writer identities, and wait for pending tools. Exact review refs cover recorded before/after content. They cannot backfill Codex's native Last turn card.
+- **Conservative recovery:** recover only a stale Git index lock proven to belong to a terminated plugin writer; preserve unrelated locks and staged data.
+
+See the [description workflow and examples](plugins/codex-p4-diff/skills/codex-p4-diff/references/commit-descriptions.md) and [changelog](CHANGELOG.md). The v0.5.6 broker and `exec_command` fixes are retained.
 
 ## What's new in v0.5.6
 
@@ -34,7 +43,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.5.6`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
+Confirm that `codex-p4-diff@billycszhao-plugins` reports version `0.6.0`. On Windows, use `codex.cmd` instead of `codex` if PowerShell execution policy blocks `codex.ps1`.
 
 Restart Codex, approve the plugin Hooks, open the P4 project, and create a new task. Existing tasks do not hot-load new Hook definitions.
 
@@ -50,17 +59,17 @@ Separate bounded OS-level locks have narrow responsibilities: `.repo-setup.lock`
 
 `PreToolUse` publishes the ownership claim and a lightweight before-manifest reservation while holding only the short shared-state lock. It then reads file content under a per-turn, per-path lock and briefly reacquires shared state to merge the snapshot metadata. Slow or large snapshots therefore do not make unrelated sessions fall through the state-lock timeout. A path discovered only by `PostToolUse`, or a failed before snapshot, becomes an explicit partial `after-only-receipt`; it never fabricates an add/delete patch or blocks the tool. Each uncertainty scope retains at most two writer summaries plus one normal timeout `pending.json`; compaction atomically ingests that file and promotes its anonymous timestamp to compaction time, preserving evidence across out-of-order writers and concurrent cleanup.
 
-The commit subject is `[Codex] <completed change>`. It is derived from the first meaningful line of the final assistant message after generic headings, status-only lines, Markdown markers, fenced code, and Codex directives are skipped. If no usable line exists, the plugin generates a title from file actions, for example `修改 A.cpp`, `新增 Config.ini`, or `更新 3 个文件：A.cpp、B.h 等`.
+The commit subject is `[Codex] <actual behavior change>`. After the final writes and child tasks finish, the executing AI follows the Hook-provided `prepare` command, reads the final diff context, and fills the turn's dedicated report. The plugin binds the report to the final captured paths, actions, and hashes. Missing, invalid, stale, incomplete, or uncertain reports produce a file-action title and an explicit explanation of the fallback; the plugin never substitutes conversation prose or assumes verification passed. A hash match establishes association with the captured diff, not the truth of every natural-language claim. Partial audit coverage remains visible.
 
 Files up to 8 MiB are eligible for commit content. Larger files retain hashes, sizes, and P4 metadata in the Git note without adding the full blob. Set `CODEX_P4_DIFF_MAX_BLOB_BYTES` to change the threshold.
 
-Each commit body contains `Change`, `Change-Summary-Source`, the redacted original `Request`, session and turn IDs, project path, file actions, hashes, sizes, and history state. Read the complete note with:
+Each new commit body contains the reason, actual changes with file references, optional decisions and limitations, separate verification categories, the redacted original `Request`, report status and source, diff digest, and session/turn IDs. For example, use “Fix handle selection priority” as the title; put “build passed; manual interaction not run” under verification. Exact file hashes, sizes, P4 metadata, and patches remain in the note. Read it with:
 
 ```powershell
 git notes --ref=codex-p4-diff show <commit>
 ```
 
-The note contains `changeSummary`, `changeSummarySource`, `assistantMessageSha256`, `promptSummary`, prompt SHA-256, timestamps, before/after metadata, read-only P4 metadata, and the exact unified text patch when captured. Only the assistant message hash is stored; the full assistant response is not copied into the note.
+The note also contains `changeDescription`, `descriptionStatus`, `descriptionDiffDigest`, writer identities, and the compatible `promptSummary`. New requests are redacted and whitespace-normalized, then stored as `requestText` up to 12,000 characters; truncation is explicit in `requestCapture`. The original prompt SHA-256 remains available. Legacy prompts retain their existing summary without fetching old conversations. Only the assistant message hash is stored; the full assistant response is not copied into the note.
 
 ## Perforce boundary
 
@@ -72,7 +81,7 @@ Incomplete shell coverage and ordinary audit errors are reported as warnings and
 
 ## Review and GitHub Desktop
 
-Codex Review can inspect the latest commit or turn because the project itself is a Git checkout. `Unstaged` shows only changes not yet captured by the Stop hook.
+Use Codex's Git commit/branch review or GitHub Desktop History to inspect the full recorded change. `Unstaged` shows only changes not yet captured by the Stop hook. The native Last turn card is maintained by Codex separately and may omit direct child-task writes; plugin commits cannot backfill it. Prefer child tasks for analysis and patches, with the main task applying the final writes. If children write directly, review all writers through Git before delivery.
 
 In GitHub Desktop, choose **File > Add Local Repository** and select the P4 project root. Stay on `codex/local-history` and use **History** to inspect commits. Do not publish the repository.
 
@@ -108,7 +117,7 @@ codex plugin add codex-p4-diff@billycszhao-plugins
 codex plugin list --json
 ```
 
-Confirm that the installed version is `0.5.6`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
+Confirm that the installed version is `0.6.0`. If `plugin add` reports that the plugin is already installed or the listed version remains older, reinstall only this public plugin:
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
@@ -117,6 +126,10 @@ codex plugin list --json
 ```
 
 Restart Codex, approve the updated Hooks, and create a new task. Do not remove a separate local-development plugin from another marketplace.
+
+Copyable update request for another Codex task:
+
+> Update the public plugin codex-p4-diff@billycszhao-plugins from https://github.com/BillyCSZhao/codex-p4-diff to its latest published version (this release is v0.6.0). First inspect the installed version, marketplace source, and supported CLI commands. Refresh only that marketplace and install the new package. If needed, reinstall only this public plugin; preserve other marketplaces, local development copies, project .git directories, State, and existing history. If the source is pinned to an older tag, identify that before changing the source. Verify the installed version and source, and run the plugin's read-only Doctor in my intended P4 project. Report what was verified and tell me to restart Codex, trust updated Hooks, and create a new task. Do not claim existing tasks hot-reloaded or old Last turn cards were repaired. Ask only for a missing project path or a decision that cannot be safely inferred.
 
 ```powershell
 codex plugin remove codex-p4-diff@billycszhao-plugins
@@ -132,7 +145,7 @@ The plugin has no telemetry and does not send project contents to a plugin-owned
 ```powershell
 python -m unittest discover -s tests -v
 python -m unittest discover -s plugins/codex-p4-diff/tests -v
-python -m py_compile plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_diff.py plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_audit.py plugins/codex-p4-diff/hooks/codex_p4_session.py
+python -m py_compile plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_diff.py plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_audit.py plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_description.py plugins/codex-p4-diff/skills/codex-p4-diff/scripts/codex_p4_review.py plugins/codex-p4-diff/hooks/codex_p4_session.py
 ```
 
 Tests use temporary directories and mocks; they do not mutate a Perforce server or workspace.

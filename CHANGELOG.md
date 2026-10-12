@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 - 2026-10-12
+
+- Replace conversational commit titles with a dedicated AI-written report bound to the final turn diff. Record why, actual behavior changes, relevant decisions, separate build/automated/manual verification, and known limitations. Keep the request separate; verification is explicitly executor-reported, not rerun by the plugin.
+- Validate session/turn identity, the complete captured file set, before/after hashes, and archive attribution. Missing, invalid, stale, incomplete, or uncertain reports fall back to file facts without blocking history. Recovery drift discards unsupported implementation and verification claims. Existing commits and frozen legacy descriptions stay unchanged.
+- Preserve the redacted, whitespace-normalized current request up to 12,000 characters with explicit truncation metadata and its original SHA-256. Keep full file evidence and patches in Git notes rather than the commit body.
+- Include linked subagent writes in their owning parent turn, retain writer identities and earliest snapshots, and wait for pending child tools before finalization. Add exact before/after review refs for all recorded writers; document that these cannot backfill Codex's native Last turn card.
+- Recover only an index lock proven to belong to a terminated plugin writer. Preserve unrelated or unverifiable locks, worktree content, and staged changes.
+- Extend lifecycle Hook output and description instructions; treat only standalone writes to the current active report as plugin metadata. Keep all other path auditing and the P4 read-only boundary intact.
+- Add regression coverage for parent/child attribution, lock recovery, review refs, feature/fix/docs/test reports, missing evidence, redaction, long requests, stale reports, and immutable history.
+
 ## 0.5.6 - 2026-09-27
 
 - Accept a legacy marker that stored the broker endpoint as its server address only after reconnecting to that exact endpoint and verifying the live broker address, client, and project mapping. Preserve the marker and existing State keys; report the resolved backend separately. Modern identity conflicts and unverified aliases still fail validation.
